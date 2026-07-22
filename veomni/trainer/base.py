@@ -78,6 +78,7 @@ from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     ChannelLossCallback,
+    ChannelLossDashboardCallback,
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
@@ -632,6 +633,8 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
+        self._channel_loss_trace_step_id: Any = None
+        self.channel_loss_dashboard_callback = ChannelLossDashboardCallback(self)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
@@ -640,13 +643,15 @@ class BaseTrainer(Stateful, ABC):
         #
         # ``channel_loss_callback`` is ordered after the meter for
         # ``on_step_end`` (the meter resets ``step_*_metrics``) and before
-        # ``wandb`` (which logs them), so its per-source metrics survive into
-        # the logged payload. ``on_step_begin`` snapshots channel metadata first
-        # because multi-source accounting consumes it.
+        # ``channel_loss_dashboard_callback`` and ``wandb``, so both the compact
+        # dashboard and the native scalar payload observe the completed source
+        # metrics. ``on_step_begin`` snapshots channel metadata first because
+        # multi-source accounting consumes it.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
+            self.channel_loss_dashboard_callback,
             self.wandb_callback,
             self.profile_callback,
             self.checkpointer_callback,
@@ -655,6 +660,18 @@ class BaseTrainer(Stateful, ABC):
             self.moe_monitor_callback,
         ]
         self.state = TrainerState()
+
+    def set_channel_loss_trace_step_id(self, trace_step_id: Any) -> None:
+        """Attach one opaque dataloader trace ID to the current optimizer step."""
+
+        self._channel_loss_trace_step_id = trace_step_id
+
+    def pop_channel_loss_trace_step_id(self) -> Any:
+        """Consume the current trace ID so it cannot leak into a later step."""
+
+        trace_step_id = self._channel_loss_trace_step_id
+        self._channel_loss_trace_step_id = None
+        return trace_step_id
 
     def on_train_begin(self):
         for callback in self._callbacks:
