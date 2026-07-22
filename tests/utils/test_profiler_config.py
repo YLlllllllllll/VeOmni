@@ -221,13 +221,73 @@ def test_npu_sidecar_log_setup_failure_is_nonfatal(monkeypatch, tmp_path):
     assert any("disk full" in warning for warning in warnings)
 
 
-def test_npu_sidecar_job_associated_upload_scopes_only_child_env(monkeypatch, tmp_path):
+def test_npu_sidecar_platform_upload_prefers_trial_in_child_env(monkeypatch, tmp_path):
     raw_dir = tmp_path / "rank0_ascend_pt"
     raw_dir.mkdir()
     popen_calls = []
 
     monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
     monkeypatch.setenv("MERLIN_JOB_ID", "stale-job")
+    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-456")
+    monkeypatch.setenv("ARNOLD_RUN_ID", "run-789")
+    monkeypatch.setattr(
+        helper.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (popen_calls.append((args, kwargs)), SimpleNamespace(pid=123))[1],
+    )
+
+    proc = helper.spawn_npu_offline_sidecar(
+        str(raw_dir),
+        analyse=True,
+        upload_cmd="upload-trace",
+        platform_associated_upload=True,
+    )
+
+    assert proc.pid == 123
+    child_env = popen_calls[0][1]["env"]
+    assert child_env["ARNOLD_TRIAL_ID"] == "trial-456"
+    assert "ARNOLD_RUN_ID" not in child_env
+    assert "RH2_JOB_RUN_ID" not in child_env
+    assert "MERLIN_JOB_ID" not in child_env
+    assert helper.os.environ["RH2_JOB_RUN_ID"] == "job-123"
+    assert helper.os.environ["MERLIN_JOB_ID"] == "stale-job"
+    assert helper.os.environ["ARNOLD_TRIAL_ID"] == "trial-456"
+    assert helper.os.environ["ARNOLD_RUN_ID"] == "run-789"
+
+
+def test_npu_sidecar_platform_upload_falls_back_to_job_in_child_env(monkeypatch, tmp_path):
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+    popen_calls = []
+
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.delenv("MERLIN_JOB_ID", raising=False)
+    monkeypatch.delenv("ARNOLD_TRIAL_ID", raising=False)
+    monkeypatch.delenv("ARNOLD_RUN_ID", raising=False)
+    monkeypatch.setattr(
+        helper.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (popen_calls.append((args, kwargs)), SimpleNamespace(pid=123))[1],
+    )
+
+    proc = helper.spawn_npu_offline_sidecar(
+        str(raw_dir),
+        analyse=True,
+        upload_cmd="upload-trace",
+        platform_associated_upload=True,
+    )
+
+    assert proc.pid == 123
+    child_env = popen_calls[0][1]["env"]
+    assert child_env["MERLIN_JOB_ID"] == "job-123"
+
+
+def test_npu_sidecar_preserves_job_associated_upload_compatibility(monkeypatch, tmp_path):
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+    popen_calls = []
+
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
     monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-456")
     monkeypatch.setenv("ARNOLD_RUN_ID", "run-789")
     monkeypatch.setattr(
@@ -248,9 +308,6 @@ def test_npu_sidecar_job_associated_upload_scopes_only_child_env(monkeypatch, tm
     assert child_env["MERLIN_JOB_ID"] == "job-123"
     assert "ARNOLD_TRIAL_ID" not in child_env
     assert "ARNOLD_RUN_ID" not in child_env
-    assert helper.os.environ["MERLIN_JOB_ID"] == "stale-job"
-    assert helper.os.environ["ARNOLD_TRIAL_ID"] == "trial-456"
-    assert helper.os.environ["ARNOLD_RUN_ID"] == "run-789"
 
 
 def test_wait_npu_profile_sidecars_reports_completion_and_timeout(monkeypatch):
@@ -450,7 +507,7 @@ def test_npu_offline_auto_uploads_in_merlin(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("explicit_upload_cmd", "expected_upload_cmd", "expected_merlin_upload", "expected_job_associated_upload"),
+    ("explicit_upload_cmd", "expected_upload_cmd", "expected_merlin_upload", "expected_platform_associated_upload"),
     [
         (None, "/opt/platform/default-standalone-upload", False, True),
         ("custom-upload", "custom-upload", False, False),
@@ -462,7 +519,7 @@ def test_npu_offline_merlin_upload_precedence(
     explicit_upload_cmd,
     expected_upload_cmd,
     expected_merlin_upload,
-    expected_job_associated_upload,
+    expected_platform_associated_upload,
 ):
     fake_profiler = _FakeNpuProfiler()
     sidecar_calls = []
@@ -503,8 +560,8 @@ def test_npu_offline_merlin_upload_precedence(
         "upload_cmd": expected_upload_cmd,
         "merlin_upload": expected_merlin_upload,
     }
-    if expected_job_associated_upload:
-        expected_kwargs["job_associated_upload"] = True
+    if expected_platform_associated_upload:
+        expected_kwargs["platform_associated_upload"] = True
     assert sidecar_calls == [((str(raw_dir),), expected_kwargs)]
 
 

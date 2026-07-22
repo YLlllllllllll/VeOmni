@@ -69,7 +69,7 @@ In `offline` mode, VeOmni can spawn a detached postprocess sidecar after raw fin
 
 | Env | Effect |
 |-----|--------|
-| unset (default) | In a Merlin job, auto-spawn sidecar: analyse → gzip → profiling upload through a platform file uploader or `merlin-cli`; otherwise preserve raw data |
+| unset (default) | In a Merlin job, auto-spawn sidecar: analyse → gzip → profiling upload through a platform file uploader or `merlin-cli`; associate with the current Trial for the JobRun Profiling tab (JobRun fallback when no Trial is available); otherwise preserve raw data |
 | `VEOMNI_UPLOAD_CMD=...` | Auto-spawn sidecar: analyse → run the command on `trace_view.json.gz` (`{trace}` placeholder supported) |
 | `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Force Merlin upload through a platform file uploader or `merlin-cli` (job/trial read from Merlin env) |
 | `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0` | Disable automatic Merlin upload |

@@ -195,8 +195,8 @@ def test_gzip_and_merlin_upload_cmd(tmp_path, monkeypatch):
     assert payload["file_path"] == str(packed)
     assert payload["asset_type"] == "perfetto"
     assert payload["name"] == "npu-trace"
-    assert payload["job_id"] == "job-123"
-    assert "trial_id" not in payload
+    assert payload["trial_id"] == "trial-ignored"
+    assert "job_id" not in payload
 
 
 def test_gzip_trace_replaces_stale_output_without_leaving_temp_files(tmp_path):
@@ -230,7 +230,7 @@ def test_merlin_upload_cmd_uses_merlin_job_id(tmp_path, monkeypatch):
     trace.write_bytes(b"trace")
     monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
     monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
-    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-ignored")
+    monkeypatch.delenv("ARNOLD_TRIAL_ID", raising=False)
 
     payload = json.loads(post.build_merlin_upload_cmd(trace)[4])
 

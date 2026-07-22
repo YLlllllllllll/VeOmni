@@ -201,13 +201,13 @@ def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> lis
     }
     if name:
         payload["name"] = name
-    # Prefer an explicit JobRun association so the asset appears on its profiling tab.
+    # The JobRun Profiling tab lists assets by its selected Arnold trial.
     job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
     trial_id = os.getenv("ARNOLD_TRIAL_ID")
-    if job_id:
-        payload["job_id"] = job_id
-    elif trial_id:
+    if trial_id:
         payload["trial_id"] = trial_id
+    elif job_id:
+        payload["job_id"] = job_id
     return ["merlin-cli", "profiling", "upload", "--json", json.dumps(payload, ensure_ascii=False)]
 
 

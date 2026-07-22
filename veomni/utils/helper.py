@@ -102,6 +102,7 @@ def spawn_npu_offline_sidecar(
     analyse: bool = True,
     upload_cmd: Optional[str] = None,
     merlin_upload: bool = False,
+    platform_associated_upload: bool = False,
     job_associated_upload: bool = False,
 ) -> Optional[subprocess.Popen]:
     """Fire-and-forget offline Ascend postprocess so training is not blocked.
@@ -132,7 +133,23 @@ def spawn_npu_offline_sidecar(
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         log_fh = open(log_path, "a", encoding="utf-8")
         sidecar_env = None
-        if job_associated_upload:
+        if platform_associated_upload:
+            trial_id = os.getenv("ARNOLD_TRIAL_ID")
+            job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
+            if trial_id:
+                sidecar_env = os.environ.copy()
+                sidecar_env["ARNOLD_TRIAL_ID"] = trial_id
+                sidecar_env.pop("RH2_JOB_RUN_ID", None)
+                sidecar_env.pop("MERLIN_JOB_ID", None)
+                sidecar_env.pop("ARNOLD_RUN_ID", None)
+            elif job_id:
+                sidecar_env = os.environ.copy()
+                sidecar_env["MERLIN_JOB_ID"] = job_id
+                sidecar_env.pop("ARNOLD_TRIAL_ID", None)
+                sidecar_env.pop("ARNOLD_RUN_ID", None)
+        elif job_associated_upload:
+            # Compatibility for direct callers of the former keyword: retain
+            # its JobRun-first environment semantics.
             job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
             if job_id:
                 sidecar_env = os.environ.copy()
@@ -940,23 +957,23 @@ def create_profiler(
             if explicit_upload_cmd:
                 selected_upload_cmd = explicit_upload_cmd
                 selected_merlin_upload = False
-                selected_job_associated_upload = False
+                selected_platform_associated_upload = False
             elif VEOMNI_UPLOAD_CMD and not automatic_upload_opted_out:
                 # Platform integrations may provide a file-based uploader that
                 # handles traces too large for an SDK JSON/base64 request. Give
-                # it a job-first environment so the asset appears on the
-                # JobRun Profile tab instead of being scoped only to a trial.
+                # it a trial-first environment because the JobRun Profiling
+                # tab queries assets through the selected Arnold trial.
                 selected_upload_cmd = VEOMNI_UPLOAD_CMD
                 selected_merlin_upload = False
-                selected_job_associated_upload = merlin_upload
+                selected_platform_associated_upload = merlin_upload
             elif merlin_upload:
                 selected_upload_cmd = None
                 selected_merlin_upload = True
-                selected_job_associated_upload = False
+                selected_platform_associated_upload = False
             else:
                 selected_upload_cmd = None
                 selected_merlin_upload = False
-                selected_job_associated_upload = False
+                selected_platform_associated_upload = False
 
             if effective_npu_analysis_mode == "async":
                 if offline_postprocess_flag is True or selected_upload_cmd or selected_merlin_upload:
@@ -976,8 +993,8 @@ def create_profiler(
                     "upload_cmd": selected_upload_cmd,
                     "merlin_upload": selected_merlin_upload,
                 }
-                if selected_job_associated_upload:
-                    sidecar_kwargs["job_associated_upload"] = True
+                if selected_platform_associated_upload:
+                    sidecar_kwargs["platform_associated_upload"] = True
                 proc = spawn_npu_offline_sidecar(str(trace_file), **sidecar_kwargs)
                 if proc is None:
                     logger.warning(
