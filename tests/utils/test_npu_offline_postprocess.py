@@ -1,4 +1,6 @@
+import gzip
 import json
+import os
 import shlex
 import sys
 import types
@@ -198,6 +200,19 @@ def test_gzip_and_merlin_upload_cmd(tmp_path, monkeypatch):
     assert "trial_id" not in payload
 
 
+def test_gzip_trace_replaces_stale_output_without_leaving_temp_files(tmp_path):
+    trace = tmp_path / "trace_view.json"
+    trace.write_bytes(b'{"traceEvents":[{"name":"new"}]}')
+    packed = tmp_path / "trace_view.json.gz"
+    packed.write_bytes(b"stale-partial-output")
+
+    result = post.gzip_trace(trace)
+
+    with gzip.open(result, "rb") as handle:
+        assert handle.read() == trace.read_bytes()
+    assert list(tmp_path.glob(".trace_view.json.gz.*.tmp")) == []
+
+
 def test_merlin_upload_cmd_uses_trial_without_job(tmp_path, monkeypatch):
     trace = tmp_path / "trace_view.json.gz"
     trace.write_bytes(b"trace")
@@ -263,6 +278,7 @@ def test_merlin_upload_uses_argv_without_shell(tmp_path, monkeypatch):
     out_dir.mkdir(parents=True)
     (out_dir / "trace_view.json").write_text("{}", encoding="utf-8")
     calls = []
+    monkeypatch.setattr(post.shutil, "which", lambda command: "/usr/bin/merlin-cli")
     monkeypatch.setattr(post.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
 
     packed = post.postprocess(raw, merlin_upload=True, upload_name="npu trace")
@@ -272,6 +288,50 @@ def test_merlin_upload_uses_argv_without_shell(tmp_path, monkeypatch):
     assert argv[:4] == ["merlin-cli", "profiling", "upload", "--json"]
     assert json.loads(argv[4])["name"] == "npu trace"
     assert calls[0][1] == {"check": True}
+
+
+def test_merlin_upload_falls_back_to_bundled_sdk(tmp_path, monkeypatch):
+    trace = tmp_path / "trace_view.json.gz"
+    trace.write_bytes(b"profile" * 10)
+    calls = []
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "run-123")
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-456")
+    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-789")
+
+    class _Uploaded:
+        sid = "sdk-sid"
+
+    class _ProfilingAsset:
+        def __init__(self, **kwargs):
+            calls.append(
+                (
+                    "init",
+                    kwargs,
+                    os.environ.get("MERLIN_JOB_ID"),
+                    os.environ.get("ARNOLD_TRIAL_ID"),
+                )
+            )
+
+        def upload(self):
+            calls.append(("upload", self.outer_type, self.outer_id))
+            return _Uploaded()
+
+    monkeypatch.setattr(post.shutil, "which", lambda command: None)
+    monkeypatch.setattr(post, "_load_bytedmerlin_profiling_asset", lambda: _ProfilingAsset)
+
+    post.upload_merlin_profile(trace, name="npu trace")
+
+    assert calls == [
+        (
+            "init",
+            {"file_path": str(trace), "name": "npu trace", "compress": False},
+            "run-123",
+            None,
+        ),
+        ("upload", "merlin_job", "run-123"),
+    ]
+    assert os.environ["MERLIN_JOB_ID"] == "job-456"
+    assert os.environ["ARNOLD_TRIAL_ID"] == "trial-789"
 
 
 def test_postprocess_requires_action(tmp_path):

@@ -22,7 +22,6 @@ import multiprocessing
 import os
 import random
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -71,7 +70,7 @@ VEOMNI_UPLOAD_CMD = os.getenv("VEOMNI_UPLOAD_CMD")
 FlopsCounter = None
 
 # Offline Ascend postprocess sidecar (analyse / durable copy / upload).
-# - unset / auto: upload on Merlin when job context and merlin-cli are available
+# - unset / auto: upload on Merlin when a JobRun context is available
 # - VEOMNI_NPU_OFFLINE_POSTPROCESS=1: always spawn after raw finalize
 # - VEOMNI_NPU_OFFLINE_POSTPROCESS=0: never spawn; preserve the local raw capture only
 VEOMNI_NPU_OFFLINE_POSTPROCESS = os.getenv("VEOMNI_NPU_OFFLINE_POSTPROCESS")
@@ -85,7 +84,7 @@ def _env_flag(value: Optional[str]) -> Optional[bool]:
 
 
 def _should_upload_npu_profile_to_merlin() -> bool:
-    """Auto-enable Merlin upload only when the current process can perform it."""
+    """Auto-enable Merlin upload in a JobRun; the sidecar selects the uploader."""
     configured = _env_flag(VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD)
     if configured is False:
         return False
@@ -93,16 +92,7 @@ def _should_upload_npu_profile_to_merlin() -> bool:
     has_merlin_context = bool(
         os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID") or os.getenv("ARNOLD_TRIAL_ID")
     )
-    merlin_cli = shutil.which("merlin-cli")
-    if merlin_cli:
-        return configured is True or has_merlin_context
-
-    if configured is True or has_merlin_context:
-        logger.warning(
-            "Automatic NPU profile upload is unavailable because merlin-cli was not found; "
-            "the raw local capture will be preserved."
-        )
-    return False
+    return configured is True or has_merlin_context
 
 
 def spawn_npu_offline_sidecar(

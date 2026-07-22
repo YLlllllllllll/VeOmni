@@ -30,7 +30,7 @@ The following configuration items will impact training performance and need to b
 - **with_stack**: Recording stack traces significantly increases profiling overhead
 - **rank0_only**: When set to False, all ranks will be profiled, generating a large number of files and consuming significant disk space and time
 - **npu_analysis_mode**:
-  - `offline` finalizes the raw `*_ascend_pt` capture during training. In a Merlin job, VeOmni automatically starts a sidecar to parse, gzip, and upload a clickable Perfetto asset when `merlin-cli` is available. Elsewhere it preserves raw data for later processing. This is the default and safest mode for large captures.
+  - `offline` finalizes the raw `*_ascend_pt` capture during training. In a Merlin job, VeOmni automatically starts a sidecar to parse, gzip, and upload a clickable profiling asset through `merlin-cli` or the SDK bundled in the JobRun image. Elsewhere it preserves raw data for later processing. This is the default and safest mode for large captures.
   - `async` calls the official torch_npu online handler with `analyse_flag=True, async_mode=True`. Raw finalization and parser submission are synchronous, but Chrome/DB analysis continues in torch_npu's process pool while training advances.
 
 ### Typical Configuration Method
@@ -69,9 +69,9 @@ In `offline` mode, VeOmni can spawn a detached postprocess sidecar after raw fin
 
 | Env | Effect |
 |-----|--------|
-| unset (default) | In a Merlin job with `merlin-cli`, auto-spawn sidecar: analyse → gzip → profiling upload; otherwise preserve raw data |
+| unset (default) | In a Merlin job, auto-spawn sidecar: analyse → gzip → profiling upload through the available CLI or SDK; otherwise preserve raw data |
 | `VEOMNI_UPLOAD_CMD=...` | Auto-spawn sidecar: analyse → run the command on `trace_view.json.gz` (`{trace}` placeholder supported) |
-| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Force Merlin upload when `merlin-cli` is available (Perfetto; job/trial read from Merlin env) |
+| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Force Merlin upload through the available CLI or SDK (job/trial read from Merlin env) |
 | `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0` | Disable automatic Merlin upload |
 | `VEOMNI_NPU_OFFLINE_POSTPROCESS=1` | Force-spawn sidecar analysis; also copy when `trace_dir` is `hdfs://` |
 | `VEOMNI_NPU_OFFLINE_POSTPROCESS=0` | Disable automatic postprocessing; raw data remains pod-local, with no synchronous fallback |
