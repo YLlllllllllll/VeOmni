@@ -28,7 +28,6 @@ import logging
 import os
 import shlex
 import shutil
-import site
 import subprocess
 import sys
 import tempfile
@@ -212,67 +211,16 @@ def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> lis
     return ["merlin-cli", "profiling", "upload", "--json", json.dumps(payload, ensure_ascii=False)]
 
 
-def _load_bytedmerlin_profiling_asset():
-    """Load the optional SDK shipped in Merlin images, including user site packages."""
-    try:
-        from bytedmerlin.assets.assets import ProfilingAsset
-
-        return ProfilingAsset
-    except ImportError:
-        user_site = site.getusersitepackages()
-        if user_site and user_site not in sys.path:
-            sys.path.append(user_site)
-        try:
-            from bytedmerlin.assets.assets import ProfilingAsset
-
-            return ProfilingAsset
-        except ImportError as exc:
-            raise RuntimeError(
-                "Merlin profile upload requires either merlin-cli or the bytedmerlin ProfilingAsset SDK."
-            ) from exc
-
-
 def upload_merlin_profile(trace_file: Path, name: Optional[str] = None) -> None:
-    """Upload with merlin-cli when present, otherwise use the SDK bundled in JobRun images."""
+    """Upload through Merlin's file-based CLI and fail safely when unavailable."""
     if shutil.which("merlin-cli"):
         run_upload_cmd(build_merlin_upload_cmd(trace_file, name=name), trace_file)
         return
 
-    profiling_asset = _load_bytedmerlin_profiling_asset()
-    logger.info("Uploading with bytedmerlin ProfilingAsset SDK: %s", trace_file)
-    # ProfilingAsset prefers ARNOLD_TRIAL_ID over MERLIN_JOB_ID and does not
-    # recognize RH2_JOB_RUN_ID. Match the CLI's job-first association so the
-    # result appears on the JobRun profiling tab. This process is a dedicated
-    # postprocess sidecar, but still restore the inherited environment.
-    job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
-    original_job_id = os.environ.get("MERLIN_JOB_ID")
-    original_trial_id = os.environ.get("ARNOLD_TRIAL_ID")
-    try:
-        if job_id:
-            os.environ["MERLIN_JOB_ID"] = job_id
-            os.environ.pop("ARNOLD_TRIAL_ID", None)
-        asset = profiling_asset(file_path=str(trace_file), name=name, compress=False)
-    finally:
-        if original_job_id is None:
-            os.environ.pop("MERLIN_JOB_ID", None)
-        else:
-            os.environ["MERLIN_JOB_ID"] = original_job_id
-        if original_trial_id is None:
-            os.environ.pop("ARNOLD_TRIAL_ID", None)
-        else:
-            os.environ["ARNOLD_TRIAL_ID"] = original_trial_id
-    if job_id:
-        asset.outer_type = "merlin_job"
-        asset.outer_id = job_id
-    uploaded = asset.upload()
-    if uploaded is None:
-        raise RuntimeError(f"bytedmerlin ProfilingAsset upload failed for {trace_file}")
-    logger.info(
-        "NPU_PROFILE_MERLIN_UPLOAD uploader=sdk sid=%s outer_type=%s outer_id=%s file_size=%d",
-        getattr(uploaded, "sid", "unknown"),
-        getattr(asset, "outer_type", "unknown"),
-        getattr(asset, "outer_id", "unknown"),
-        trace_file.stat().st_size,
+    raise RuntimeError(
+        "merlin-cli is unavailable. The bytedmerlin ProfilingAsset SDK fallback is intentionally unsupported "
+        "because its JSON/base64 upload is unsafe for large traces. No upload was attempted; the raw profile "
+        f"and packed trace remain on disk (trace={trace_file})."
     )
 
 
@@ -344,7 +292,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--merlin-upload",
         action="store_true",
-        help="Upload the parsed Chrome trace with the available Merlin CLI or SDK.",
+        help="Upload the parsed Chrome trace with the file-based Merlin CLI.",
     )
     parser.add_argument("--upload-name", default=None, help="Optional Merlin asset display name")
     parser.add_argument("--max-process-number", type=int, default=None, help="torch_npu analyse parallelism")

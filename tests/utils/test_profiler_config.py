@@ -17,6 +17,7 @@ def _isolate_merlin_profile_auto_upload(monkeypatch):
     monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
     monkeypatch.delenv("MERLIN_JOB_ID", raising=False)
     monkeypatch.delenv("ARNOLD_TRIAL_ID", raising=False)
+    monkeypatch.delenv("ARNOLD_RUN_ID", raising=False)
 
 
 class _FakeNpuProfiler:
@@ -220,6 +221,38 @@ def test_npu_sidecar_log_setup_failure_is_nonfatal(monkeypatch, tmp_path):
     assert any("disk full" in warning for warning in warnings)
 
 
+def test_npu_sidecar_job_associated_upload_scopes_only_child_env(monkeypatch, tmp_path):
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+    popen_calls = []
+
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.setenv("MERLIN_JOB_ID", "stale-job")
+    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-456")
+    monkeypatch.setenv("ARNOLD_RUN_ID", "run-789")
+    monkeypatch.setattr(
+        helper.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (popen_calls.append((args, kwargs)), SimpleNamespace(pid=123))[1],
+    )
+
+    proc = helper.spawn_npu_offline_sidecar(
+        str(raw_dir),
+        analyse=True,
+        upload_cmd="upload-trace",
+        job_associated_upload=True,
+    )
+
+    assert proc.pid == 123
+    child_env = popen_calls[0][1]["env"]
+    assert child_env["MERLIN_JOB_ID"] == "job-123"
+    assert "ARNOLD_TRIAL_ID" not in child_env
+    assert "ARNOLD_RUN_ID" not in child_env
+    assert helper.os.environ["MERLIN_JOB_ID"] == "stale-job"
+    assert helper.os.environ["ARNOLD_TRIAL_ID"] == "trial-456"
+    assert helper.os.environ["ARNOLD_RUN_ID"] == "run-789"
+
+
 def test_wait_npu_profile_sidecars_reports_completion_and_timeout(monkeypatch):
     logs = []
     warnings = []
@@ -417,8 +450,11 @@ def test_npu_offline_auto_uploads_in_merlin(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("explicit_upload_cmd", "expected_upload_cmd", "expected_merlin_upload"),
-    [(None, None, True), ("custom-upload", "custom-upload", False)],
+    ("explicit_upload_cmd", "expected_upload_cmd", "expected_merlin_upload", "expected_job_associated_upload"),
+    [
+        (None, "/opt/platform/default-standalone-upload", False, True),
+        ("custom-upload", "custom-upload", False, False),
+    ],
 )
 def test_npu_offline_merlin_upload_precedence(
     monkeypatch,
@@ -426,6 +462,7 @@ def test_npu_offline_merlin_upload_precedence(
     explicit_upload_cmd,
     expected_upload_cmd,
     expected_merlin_upload,
+    expected_job_associated_upload,
 ):
     fake_profiler = _FakeNpuProfiler()
     sidecar_calls = []
@@ -460,17 +497,50 @@ def test_npu_offline_merlin_upload_precedence(
     )
     profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
 
-    assert sidecar_calls == [
-        (
-            (str(raw_dir),),
-            {
-                "copy_to": None,
-                "analyse": True,
-                "upload_cmd": expected_upload_cmd,
-                "merlin_upload": expected_merlin_upload,
-            },
-        )
-    ]
+    expected_kwargs = {
+        "copy_to": None,
+        "analyse": True,
+        "upload_cmd": expected_upload_cmd,
+        "merlin_upload": expected_merlin_upload,
+    }
+    if expected_job_associated_upload:
+        expected_kwargs["job_associated_upload"] = True
+    assert sidecar_calls == [((str(raw_dir),), expected_kwargs)]
+
+
+def test_npu_offline_merlin_upload_opt_out_disables_platform_default(monkeypatch, tmp_path):
+    fake_profiler = _FakeNpuProfiler()
+    sidecar_calls = []
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "/opt/platform/default-standalone-upload")
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", "0")
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
+    monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: sidecar_calls.append((args, kwargs)),
+    )
+
+    profiler = helper.create_profiler(
+        start_step=1,
+        end_step=2,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        global_rank=0,
+        npu_analysis_mode="offline",
+    )
+    profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
+
+    assert sidecar_calls == []
 
 
 def test_npu_offline_auto_upload_uses_sidecar_without_merlin_cli(monkeypatch, tmp_path):
@@ -743,6 +813,7 @@ def test_npu_profile_synchronizes_finalization(monkeypatch, npu_analysis_mode, t
 
 def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
     events = []
+    warnings = []
     profile_config = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=6, this_rank=True)
     callback = object.__new__(trace_callback.ProfileTraceCallback)
     callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile_config)))
@@ -757,11 +828,49 @@ def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(trace_callback.logger, "warning", warnings.append)
 
-    with pytest.raises(RuntimeError, match="raw dump failed"):
-        callback.on_step_end(TrainerState(global_step=5))
+    callback.on_step_end(TrainerState(global_step=5))
 
     assert events == ["barrier", "step", "barrier"]
+    assert callback._profiler_failed is True
+    assert callback._profiler_stopped is True
+    assert any("training will continue" in warning and "raw dump failed" in warning for warning in warnings)
+
+
+def test_npu_profile_initialization_error_is_nonfatal(monkeypatch, tmp_path):
+    warnings = []
+    profile_config = SimpleNamespace(
+        enable=True,
+        start_step=5,
+        end_step=6,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        npu_analysis_mode="offline",
+        this_rank=True,
+    )
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(profile=profile_config, global_rank=0))
+    )
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(
+        trace_callback.helper,
+        "create_profiler",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("profiler start failed")),
+    )
+    monkeypatch.setattr(trace_callback.logger, "warning", warnings.append)
+
+    callback.on_train_begin(TrainerState(global_step=0))
+
+    assert callback.profiler is None
+    assert callback._profile_active is True
+    assert callback._profiler_failed is True
+    assert callback._profiler_stopped is True
+    assert any("training will continue" in warning and "profiler start failed" in warning for warning in warnings)
 
 
 def test_npu_profile_logs_full_step_and_finalize_breakdown(monkeypatch):
@@ -936,6 +1045,40 @@ def test_npu_profile_train_end_does_not_stop_twice(monkeypatch):
     callback.on_train_end(TrainerState(global_step=30))
 
     assert events == ["wait"]
+
+
+def test_npu_profile_train_end_stop_error_is_nonfatal_and_releases_barrier(monkeypatch):
+    events = []
+    warnings = []
+    profile_config = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=20, this_rank=True)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(profile=profile_config, global_rank=0))
+    )
+    callback._profile_active = True
+    callback._profiler_stopped = False
+    callback._profiler_failed = False
+
+    def fail_stop():
+        events.append("stop")
+        raise RuntimeError("profiler cleanup failed")
+
+    callback.profiler = SimpleNamespace(_veomni_npu_analysis_mode="offline", stop=fail_stop)
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(trace_callback.logger, "warning", warnings.append)
+    monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
+
+    callback.on_train_end(TrainerState(global_step=10))
+
+    assert events == ["barrier", "stop", "barrier", "wait"]
+    assert callback._profile_active is False
+    assert callback._profiler_failed is True
+    assert callback._profiler_stopped is True
+    assert any("training completion will continue" in warning for warning in warnings)
 
 
 def test_profile_schedule_finalizes_at_end_step_minus_one():

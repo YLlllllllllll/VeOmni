@@ -30,7 +30,7 @@ The following configuration items will impact training performance and need to b
 - **with_stack**: Recording stack traces significantly increases profiling overhead
 - **rank0_only**: When set to False, all ranks will be profiled, generating a large number of files and consuming significant disk space and time
 - **npu_analysis_mode**:
-  - `offline` finalizes the raw `*_ascend_pt` capture during training. In a Merlin job, VeOmni automatically starts a sidecar to parse, gzip, and upload a clickable profiling asset through `merlin-cli` or the SDK bundled in the JobRun image. Elsewhere it preserves raw data for later processing. This is the default and safest mode for large captures.
+  - `offline` finalizes the raw `*_ascend_pt` capture during training. In a Merlin job, VeOmni automatically starts a sidecar to parse, gzip, and upload a clickable profiling asset through a platform-provided file uploader or `merlin-cli`. It deliberately avoids JSON/base64 SDK uploads for large traces. If no safe uploader is available, the sidecar reports the failure and preserves raw data. This is the default and safest mode for large captures.
   - `async` calls the official torch_npu online handler with `analyse_flag=True, async_mode=True`. Raw finalization and parser submission are synchronous, but Chrome/DB analysis continues in torch_npu's process pool while training advances.
 
 ### Typical Configuration Method
@@ -69,16 +69,16 @@ In `offline` mode, VeOmni can spawn a detached postprocess sidecar after raw fin
 
 | Env | Effect |
 |-----|--------|
-| unset (default) | In a Merlin job, auto-spawn sidecar: analyse → gzip → profiling upload through the available CLI or SDK; otherwise preserve raw data |
+| unset (default) | In a Merlin job, auto-spawn sidecar: analyse → gzip → profiling upload through a platform file uploader or `merlin-cli`; otherwise preserve raw data |
 | `VEOMNI_UPLOAD_CMD=...` | Auto-spawn sidecar: analyse → run the command on `trace_view.json.gz` (`{trace}` placeholder supported) |
-| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Force Merlin upload through the available CLI or SDK (job/trial read from Merlin env) |
+| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Force Merlin upload through a platform file uploader or `merlin-cli` (job/trial read from Merlin env) |
 | `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0` | Disable automatic Merlin upload |
 | `VEOMNI_NPU_OFFLINE_POSTPROCESS=1` | Force-spawn sidecar analysis; also copy when `trace_dir` is `hdfs://` |
 | `VEOMNI_NPU_OFFLINE_POSTPROCESS=0` | Disable automatic postprocessing; raw data remains pod-local, with no synchronous fallback |
 
 VeOmni waits for an automatically spawned sidecar for up to 300 seconds when training ends. A timeout is non-fatal and leaves the raw local capture in place; for very large captures, use the manual postprocess command below while the pod remains alive.
 
-Manual / external postprocess (recommended when the train pod may exit soon after capture):
+Manual / external postprocess (recommended when the train pod may exit soon after capture; `--merlin-upload` requires `merlin-cli` on `PATH`):
 
 ```bash
 python -m veomni.utils.npu_offline_postprocess \
@@ -88,7 +88,10 @@ python -m veomni.utils.npu_offline_postprocess \
   --merlin-upload
 ```
 
+If only a platform file uploader is available, pass it explicitly with `--upload-cmd '<command>'` instead.
+
 Sidecar logs are written next to the raw directory as `veomni_npu_offline_postprocess.log`. Sidecar startup, analysis, or upload failures never fall back to synchronous work in the distributed barrier; the raw capture remains available for recovery.
+NPU profiler initialization, raw finalization, and cleanup failures are also non-fatal: the failing rank disables further profiling, every rank still leaves the paired barrier, and training continues.
 
 For distributed Ascend training, use the following options together:
 

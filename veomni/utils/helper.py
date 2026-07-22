@@ -102,6 +102,7 @@ def spawn_npu_offline_sidecar(
     analyse: bool = True,
     upload_cmd: Optional[str] = None,
     merlin_upload: bool = False,
+    job_associated_upload: bool = False,
 ) -> Optional[subprocess.Popen]:
     """Fire-and-forget offline Ascend postprocess so training is not blocked.
 
@@ -130,12 +131,21 @@ def spawn_npu_offline_sidecar(
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         log_fh = open(log_path, "a", encoding="utf-8")
+        sidecar_env = None
+        if job_associated_upload:
+            job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
+            if job_id:
+                sidecar_env = os.environ.copy()
+                sidecar_env["MERLIN_JOB_ID"] = job_id
+                sidecar_env.pop("ARNOLD_TRIAL_ID", None)
+                sidecar_env.pop("ARNOLD_RUN_ID", None)
         proc = subprocess.Popen(
             cmd,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
+            env=sidecar_env,
         )
     except Exception as exc:
         logger.warning(f"Failed to spawn NPU offline postprocess sidecar: {exc}")
@@ -926,19 +936,27 @@ def create_profiler(
             offline_postprocess_flag = _env_flag(VEOMNI_NPU_OFFLINE_POSTPROCESS)
             merlin_upload = _should_upload_npu_profile_to_merlin()
             explicit_upload_cmd = os.getenv("VEOMNI_UPLOAD_CMD")
+            automatic_upload_opted_out = _env_flag(VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD) is False
             if explicit_upload_cmd:
                 selected_upload_cmd = explicit_upload_cmd
                 selected_merlin_upload = False
-            elif merlin_upload:
-                # Downstream integrations may patch VEOMNI_UPLOAD_CMD with a
-                # generic standalone uploader. In a JobRun, prefer the
-                # job-associated Profile asset unless the user explicitly set
-                # VEOMNI_UPLOAD_CMD in the environment.
-                selected_upload_cmd = None
-                selected_merlin_upload = True
-            else:
+                selected_job_associated_upload = False
+            elif VEOMNI_UPLOAD_CMD and not automatic_upload_opted_out:
+                # Platform integrations may provide a file-based uploader that
+                # handles traces too large for an SDK JSON/base64 request. Give
+                # it a job-first environment so the asset appears on the
+                # JobRun Profile tab instead of being scoped only to a trial.
                 selected_upload_cmd = VEOMNI_UPLOAD_CMD
                 selected_merlin_upload = False
+                selected_job_associated_upload = merlin_upload
+            elif merlin_upload:
+                selected_upload_cmd = None
+                selected_merlin_upload = True
+                selected_job_associated_upload = False
+            else:
+                selected_upload_cmd = None
+                selected_merlin_upload = False
+                selected_job_associated_upload = False
 
             if effective_npu_analysis_mode == "async":
                 if offline_postprocess_flag is True or selected_upload_cmd or selected_merlin_upload:
@@ -952,13 +970,15 @@ def create_profiler(
             needs_analysis = offline_postprocess_flag is True or bool(selected_upload_cmd) or selected_merlin_upload
             needs_sidecar = needs_copy or needs_analysis
             if needs_sidecar and offline_postprocess_flag is not False:
-                proc = spawn_npu_offline_sidecar(
-                    str(trace_file),
-                    copy_to=trace_dir if needs_copy else None,
-                    analyse=needs_analysis,
-                    upload_cmd=selected_upload_cmd,
-                    merlin_upload=selected_merlin_upload,
-                )
+                sidecar_kwargs = {
+                    "copy_to": trace_dir if needs_copy else None,
+                    "analyse": needs_analysis,
+                    "upload_cmd": selected_upload_cmd,
+                    "merlin_upload": selected_merlin_upload,
+                }
+                if selected_job_associated_upload:
+                    sidecar_kwargs["job_associated_upload"] = True
+                proc = spawn_npu_offline_sidecar(str(trace_file), **sidecar_kwargs)
                 if proc is None:
                     logger.warning(
                         "NPU offline postprocess sidecar did not start; no synchronous fallback will run inside the "

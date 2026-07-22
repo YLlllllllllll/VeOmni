@@ -165,6 +165,7 @@ class ProfileTraceCallback(Callback):
         self.profiler = None
         self._profile_active = False
         self._profiler_stopped = False
+        self._profiler_failed = False
         self._step_started_at = None
         self._profile_timing_start_step = None
         if not args.train.profile.enable:
@@ -187,18 +188,29 @@ class ProfileTraceCallback(Callback):
         # training steps.
         self._profile_timing_start_step = first_profile_step - 1
         if args.train.profile.this_rank:
-            self.profiler = helper.create_profiler(
-                start_step=first_profile_step - state.global_step,
-                end_step=args.train.profile.end_step - state.global_step,
-                trace_dir=args.train.profile.trace_dir,
-                record_shapes=args.train.profile.record_shapes,
-                profile_memory=args.train.profile.profile_memory,
-                with_stack=args.train.profile.with_stack,
-                with_modules=args.train.profile.with_modules,
-                global_rank=args.train.global_rank,
-                npu_analysis_mode=args.train.profile.npu_analysis_mode,
-            )
-            self.profiler.start()
+            try:
+                self.profiler = helper.create_profiler(
+                    start_step=first_profile_step - state.global_step,
+                    end_step=args.train.profile.end_step - state.global_step,
+                    trace_dir=args.train.profile.trace_dir,
+                    record_shapes=args.train.profile.record_shapes,
+                    profile_memory=args.train.profile.profile_memory,
+                    with_stack=args.train.profile.with_stack,
+                    with_modules=args.train.profile.with_modules,
+                    global_rank=args.train.global_rank,
+                    npu_analysis_mode=args.train.profile.npu_analysis_mode,
+                )
+                self.profiler.start()
+            except Exception as exc:
+                if not helper.IS_NPU_AVAILABLE:
+                    raise
+                self.profiler = None
+                self._profiler_failed = True
+                self._profiler_stopped = True
+                logger.warning(
+                    "NPU profiler initialization failed; profiling is disabled for this rank and training will "
+                    f"continue. Error: {exc}"
+                )
 
     def on_step_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
@@ -235,21 +247,35 @@ class ProfileTraceCallback(Callback):
             dist.barrier()
             pre_barrier_seconds = time.perf_counter() - started
 
+        profile_error = None
         try:
-            if self.profiler is not None:
-                if state.global_step <= args.train.profile.end_step:
-                    started = time.perf_counter()
-                    self.profiler.step()
-                    profiler_step_seconds = time.perf_counter() - started
+            if self.profiler is not None and not getattr(self, "_profiler_failed", False):
+                try:
+                    if state.global_step <= args.train.profile.end_step:
+                        started = time.perf_counter()
+                        self.profiler.step()
+                        profiler_step_seconds = time.perf_counter() - started
 
-                if state.global_step == args.train.profile.end_step:
-                    self.profiler.stop()
+                    if state.global_step == args.train.profile.end_step:
+                        self.profiler.stop()
+                        self._profiler_stopped = True
+                except Exception as exc:
+                    if not helper.IS_NPU_AVAILABLE:
+                        raise
+                    profile_error = exc
+                    self._profiler_failed = True
                     self._profiler_stopped = True
         finally:
             if synchronize_finalize:
                 started = time.perf_counter()
                 dist.barrier()
                 post_barrier_seconds = time.perf_counter() - started
+
+        if profile_error is not None:
+            logger.warning(
+                "NPU profiler finalization failed; profiling is disabled for this rank and training will continue "
+                f"after all ranks leave the finalization barrier. Error: {profile_error}"
+            )
 
         if state.global_step == args.train.profile.end_step:
             self._profile_active = False
@@ -286,8 +312,16 @@ class ProfileTraceCallback(Callback):
             dist.barrier()
         try:
             if self.profiler is not None and not getattr(self, "_profiler_stopped", False):
-                self.profiler.stop()
-                self._profiler_stopped = True
+                try:
+                    self.profiler.stop()
+                except Exception as exc:
+                    self._profiler_failed = True
+                    logger.warning(
+                        "NPU profiler cleanup failed; training completion will continue after all ranks leave the "
+                        f"cleanup barrier. Error: {exc}"
+                    )
+                finally:
+                    self._profiler_stopped = True
         finally:
             if synchronize_cleanup:
                 dist.barrier()

@@ -1,6 +1,5 @@
 import gzip
 import json
-import os
 import shlex
 import sys
 import types
@@ -290,48 +289,39 @@ def test_merlin_upload_uses_argv_without_shell(tmp_path, monkeypatch):
     assert calls[0][1] == {"check": True}
 
 
-def test_merlin_upload_falls_back_to_bundled_sdk(tmp_path, monkeypatch):
+def test_merlin_upload_without_cli_rejects_sdk_fallback(tmp_path, monkeypatch):
     trace = tmp_path / "trace_view.json.gz"
-    trace.write_bytes(b"profile" * 10)
-    calls = []
-    monkeypatch.setenv("RH2_JOB_RUN_ID", "run-123")
-    monkeypatch.setenv("MERLIN_JOB_ID", "job-456")
-    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-789")
-
-    class _Uploaded:
-        sid = "sdk-sid"
-
-    class _ProfilingAsset:
-        def __init__(self, **kwargs):
-            calls.append(
-                (
-                    "init",
-                    kwargs,
-                    os.environ.get("MERLIN_JOB_ID"),
-                    os.environ.get("ARNOLD_TRIAL_ID"),
-                )
-            )
-
-        def upload(self):
-            calls.append(("upload", self.outer_type, self.outer_id))
-            return _Uploaded()
+    contents = b"profile" * 10
+    trace.write_bytes(contents)
 
     monkeypatch.setattr(post.shutil, "which", lambda command: None)
-    monkeypatch.setattr(post, "_load_bytedmerlin_profiling_asset", lambda: _ProfilingAsset)
 
-    post.upload_merlin_profile(trace, name="npu trace")
+    with pytest.raises(RuntimeError, match="merlin-cli.*intentionally unsupported.*base64") as exc_info:
+        post.upload_merlin_profile(trace, name="npu trace")
 
-    assert calls == [
-        (
-            "init",
-            {"file_path": str(trace), "name": "npu trace", "compress": False},
-            "run-123",
-            None,
-        ),
-        ("upload", "merlin_job", "run-123"),
-    ]
-    assert os.environ["MERLIN_JOB_ID"] == "job-456"
-    assert os.environ["ARNOLD_TRIAL_ID"] == "trial-789"
+    assert "remain on disk" in str(exc_info.value)
+    assert str(trace) in str(exc_info.value)
+    assert trace.read_bytes() == contents
+
+
+def test_postprocess_without_merlin_cli_preserves_raw_and_packed_trace(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    out_dir = raw / "ASCEND_PROFILER_OUTPUT"
+    out_dir.mkdir(parents=True)
+    trace = out_dir / "trace_view.json"
+    contents = b'{"traceEvents":[]}'
+    trace.write_bytes(contents)
+    monkeypatch.setattr(post.shutil, "which", lambda command: None)
+
+    with pytest.raises(RuntimeError, match="raw profile.*remain on disk"):
+        post.postprocess(raw, merlin_upload=True)
+
+    packed = out_dir / "trace_view.json.gz"
+    assert raw.is_dir()
+    assert trace.read_bytes() == contents
+    assert packed.is_file()
+    with gzip.open(packed, "rb") as handle:
+        assert handle.read() == contents
 
 
 def test_postprocess_requires_action(tmp_path):

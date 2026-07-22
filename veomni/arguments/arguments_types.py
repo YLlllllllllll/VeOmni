@@ -284,7 +284,7 @@ class ProfileConfig:
         metadata={
             "help": (
                 "Ascend trace analysis mode. 'offline' finalizes raw data during training and automatically "
-                "postprocesses/uploads it in Merlin through the available CLI or SDK (disable with "
+                "postprocesses/uploads it in Merlin through a file-based platform uploader or merlin-cli (disable with "
                 "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0); 'async' starts torch_npu online analysis in its background "
                 "process pool. This option only affects NPU profiling."
             )
