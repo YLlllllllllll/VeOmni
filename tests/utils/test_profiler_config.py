@@ -14,6 +14,7 @@ from veomni.utils import helper
 @pytest.fixture(autouse=True)
 def _isolate_merlin_profile_auto_upload(monkeypatch):
     monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
+    monkeypatch.delenv("MERLIN_JOB_ID", raising=False)
     monkeypatch.delenv("ARNOLD_TRIAL_ID", raising=False)
     monkeypatch.setattr(helper.shutil, "which", lambda command: None)
 
@@ -387,7 +388,7 @@ def test_npu_offline_auto_uploads_in_merlin(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
     monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
     monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
-    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     monkeypatch.setattr(helper.shutil, "which", lambda command: "/usr/bin/merlin-cli")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(
@@ -428,7 +429,7 @@ def test_npu_offline_auto_upload_skips_without_merlin_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
     monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
     monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
-    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     monkeypatch.setattr(helper.shutil, "which", lambda command: None)
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper, "spawn_npu_offline_sidecar", lambda *args, **kwargs: pytest.fail("must not spawn"))

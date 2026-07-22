@@ -90,7 +90,9 @@ def _should_upload_npu_profile_to_merlin() -> bool:
     if configured is False:
         return False
 
-    has_merlin_context = bool(os.getenv("RH2_JOB_RUN_ID") or os.getenv("ARNOLD_TRIAL_ID"))
+    has_merlin_context = bool(
+        os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID") or os.getenv("ARNOLD_TRIAL_ID")
+    )
     merlin_cli = shutil.which("merlin-cli")
     if merlin_cli:
         return configured is True or has_merlin_context

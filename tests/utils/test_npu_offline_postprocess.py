@@ -202,12 +202,26 @@ def test_merlin_upload_cmd_uses_trial_without_job(tmp_path, monkeypatch):
     trace = tmp_path / "trace_view.json.gz"
     trace.write_bytes(b"trace")
     monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
+    monkeypatch.delenv("MERLIN_JOB_ID", raising=False)
     monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-123")
 
     payload = json.loads(post.build_merlin_upload_cmd(trace)[4])
 
     assert payload["trial_id"] == "trial-123"
     assert "job_id" not in payload
+
+
+def test_merlin_upload_cmd_uses_merlin_job_id(tmp_path, monkeypatch):
+    trace = tmp_path / "trace_view.json.gz"
+    trace.write_bytes(b"trace")
+    monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
+    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-ignored")
+
+    payload = json.loads(post.build_merlin_upload_cmd(trace)[4])
+
+    assert payload["job_id"] == "job-123"
+    assert "trial_id" not in payload
 
 
 def test_postprocess_upload_without_analyse_uses_existing_trace(tmp_path, monkeypatch):
