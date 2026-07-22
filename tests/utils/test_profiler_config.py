@@ -11,6 +11,13 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils import helper
 
 
+@pytest.fixture(autouse=True)
+def _isolate_merlin_profile_auto_upload(monkeypatch):
+    monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
+    monkeypatch.delenv("ARNOLD_TRIAL_ID", raising=False)
+    monkeypatch.setattr(helper.shutil, "which", lambda command: None)
+
+
 class _FakeNpuProfiler:
     class ProfilerActivity:
         CPU = "cpu"
@@ -339,6 +346,7 @@ def test_npu_offline_spawns_merlin_upload_sidecar(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
     monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
     monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", "1")
+    monkeypatch.setattr(helper.shutil, "which", lambda command: "/usr/bin/merlin-cli")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
     monkeypatch.setattr(
@@ -366,6 +374,81 @@ def test_npu_offline_spawns_merlin_upload_sidecar(monkeypatch, tmp_path):
             {"copy_to": None, "analyse": True, "upload_cmd": None, "merlin_upload": True},
         )
     ]
+
+
+def test_npu_offline_auto_uploads_in_merlin(monkeypatch, tmp_path):
+    fake_profiler = _FakeNpuProfiler()
+    sidecar_calls = []
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.setattr(helper.shutil, "which", lambda command: "/usr/bin/merlin-cli")
+    monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: (sidecar_calls.append((args, kwargs)), SimpleNamespace(pid=123))[1],
+    )
+
+    profiler = helper.create_profiler(
+        start_step=1,
+        end_step=2,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        global_rank=0,
+        npu_analysis_mode="offline",
+    )
+    profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
+
+    assert sidecar_calls == [
+        (
+            (str(raw_dir),),
+            {"copy_to": None, "analyse": True, "upload_cmd": None, "merlin_upload": True},
+        )
+    ]
+
+
+def test_npu_offline_auto_upload_skips_without_merlin_cli(monkeypatch, tmp_path):
+    fake_profiler = _FakeNpuProfiler()
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+    warnings = []
+
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.setattr(helper.shutil, "which", lambda command: None)
+    monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
+    monkeypatch.setattr(helper, "spawn_npu_offline_sidecar", lambda *args, **kwargs: pytest.fail("must not spawn"))
+    monkeypatch.setattr(helper.logger, "warning", warnings.append)
+
+    profiler = helper.create_profiler(
+        start_step=1,
+        end_step=2,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        global_rank=0,
+        npu_analysis_mode="offline",
+    )
+    profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
+
+    assert profiler._veomni_npu_sidecars == []
+    assert any("merlin-cli was not found" in warning for warning in warnings)
 
 
 def test_npu_offline_sidecar_failure_preserves_raw_without_sync_fallback(monkeypatch, tmp_path):

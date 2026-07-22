@@ -283,8 +283,10 @@ class ProfileConfig:
         default="offline",
         metadata={
             "help": (
-                "Ascend trace analysis mode. 'offline' only finalizes raw data during training; 'async' starts "
-                "torch_npu online analysis in its background process pool. This option only affects NPU profiling."
+                "Ascend trace analysis mode. 'offline' finalizes raw data during training and automatically "
+                "postprocesses/uploads it when Merlin context and merlin-cli are available (disable with "
+                "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0); 'async' starts torch_npu online analysis in its background "
+                "process pool. This option only affects NPU profiling."
             )
         },
     )

@@ -175,7 +175,7 @@ def test_copy_raw_dir_refuses_existing_hdfs_target(tmp_path, monkeypatch):
     assert copies == []
 
 
-def test_gzip_and_merlin_upload_cmd(tmp_path):
+def test_gzip_and_merlin_upload_cmd(tmp_path, monkeypatch):
     raw = tmp_path / "rank0_ascend_pt"
     out_dir = raw / "ASCEND_PROFILER_OUTPUT"
     out_dir.mkdir(parents=True)
@@ -186,12 +186,28 @@ def test_gzip_and_merlin_upload_cmd(tmp_path):
     assert packed.is_file()
     assert packed.name.endswith(".gz")
 
+    monkeypatch.setenv("RH2_JOB_RUN_ID", "job-123")
+    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-ignored")
     cmd = post.build_merlin_upload_cmd(packed, name="npu-trace")
     assert cmd[:4] == ["merlin-cli", "profiling", "upload", "--json"]
     payload = json.loads(cmd[4])
     assert payload["file_path"] == str(packed)
     assert payload["asset_type"] == "perfetto"
     assert payload["name"] == "npu-trace"
+    assert payload["job_id"] == "job-123"
+    assert "trial_id" not in payload
+
+
+def test_merlin_upload_cmd_uses_trial_without_job(tmp_path, monkeypatch):
+    trace = tmp_path / "trace_view.json.gz"
+    trace.write_bytes(b"trace")
+    monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
+    monkeypatch.setenv("ARNOLD_TRIAL_ID", "trial-123")
+
+    payload = json.loads(post.build_merlin_upload_cmd(trace)[4])
+
+    assert payload["trial_id"] == "trial-123"
+    assert "job_id" not in payload
 
 
 def test_postprocess_upload_without_analyse_uses_existing_trace(tmp_path, monkeypatch):
