@@ -925,9 +925,23 @@ def create_profiler(
         if IS_NPU_AVAILABLE:
             offline_postprocess_flag = _env_flag(VEOMNI_NPU_OFFLINE_POSTPROCESS)
             merlin_upload = _should_upload_npu_profile_to_merlin()
+            explicit_upload_cmd = os.getenv("VEOMNI_UPLOAD_CMD")
+            if explicit_upload_cmd:
+                selected_upload_cmd = explicit_upload_cmd
+                selected_merlin_upload = False
+            elif merlin_upload:
+                # Downstream integrations may patch VEOMNI_UPLOAD_CMD with a
+                # generic standalone uploader. In a JobRun, prefer the
+                # job-associated Profile asset unless the user explicitly set
+                # VEOMNI_UPLOAD_CMD in the environment.
+                selected_upload_cmd = None
+                selected_merlin_upload = True
+            else:
+                selected_upload_cmd = VEOMNI_UPLOAD_CMD
+                selected_merlin_upload = False
 
             if effective_npu_analysis_mode == "async":
-                if offline_postprocess_flag is True or VEOMNI_UPLOAD_CMD or merlin_upload:
+                if offline_postprocess_flag is True or selected_upload_cmd or selected_merlin_upload:
                     logger.warning(
                         "Automatic copy/upload is skipped for NPU async analysis because the background parser may "
                         f"still be writing {trace_file}. Upload the completed trace after training exits."
@@ -935,15 +949,15 @@ def create_profiler(
                 return
 
             needs_copy = is_hdfs_trace
-            needs_analysis = offline_postprocess_flag is True or bool(VEOMNI_UPLOAD_CMD) or merlin_upload
+            needs_analysis = offline_postprocess_flag is True or bool(selected_upload_cmd) or selected_merlin_upload
             needs_sidecar = needs_copy or needs_analysis
             if needs_sidecar and offline_postprocess_flag is not False:
                 proc = spawn_npu_offline_sidecar(
                     str(trace_file),
                     copy_to=trace_dir if needs_copy else None,
                     analyse=needs_analysis,
-                    upload_cmd=VEOMNI_UPLOAD_CMD,
-                    merlin_upload=merlin_upload and not VEOMNI_UPLOAD_CMD,
+                    upload_cmd=selected_upload_cmd,
+                    merlin_upload=selected_merlin_upload,
                 )
                 if proc is None:
                     logger.warning(

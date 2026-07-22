@@ -13,6 +13,7 @@ from veomni.utils import helper
 
 @pytest.fixture(autouse=True)
 def _isolate_merlin_profile_auto_upload(monkeypatch):
+    monkeypatch.delenv("VEOMNI_UPLOAD_CMD", raising=False)
     monkeypatch.delenv("RH2_JOB_RUN_ID", raising=False)
     monkeypatch.delenv("MERLIN_JOB_ID", raising=False)
     monkeypatch.delenv("ARNOLD_TRIAL_ID", raising=False)
@@ -411,6 +412,63 @@ def test_npu_offline_auto_uploads_in_merlin(monkeypatch, tmp_path):
         (
             (str(raw_dir),),
             {"copy_to": None, "analyse": True, "upload_cmd": None, "merlin_upload": True},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("explicit_upload_cmd", "expected_upload_cmd", "expected_merlin_upload"),
+    [(None, None, True), ("custom-upload", "custom-upload", False)],
+)
+def test_npu_offline_merlin_upload_precedence(
+    monkeypatch,
+    tmp_path,
+    explicit_upload_cmd,
+    expected_upload_cmd,
+    expected_merlin_upload,
+):
+    fake_profiler = _FakeNpuProfiler()
+    sidecar_calls = []
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "/opt/platform/default-standalone-upload")
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
+    if explicit_upload_cmd is not None:
+        monkeypatch.setenv("VEOMNI_UPLOAD_CMD", explicit_upload_cmd)
+    monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: (sidecar_calls.append((args, kwargs)), SimpleNamespace(pid=123))[1],
+    )
+
+    profiler = helper.create_profiler(
+        start_step=1,
+        end_step=2,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        global_rank=0,
+        npu_analysis_mode="offline",
+    )
+    profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
+
+    assert sidecar_calls == [
+        (
+            (str(raw_dir),),
+            {
+                "copy_to": None,
+                "analyse": True,
+                "upload_cmd": expected_upload_cmd,
+                "merlin_upload": expected_merlin_upload,
+            },
         )
     ]
 
