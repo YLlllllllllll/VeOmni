@@ -27,6 +27,8 @@ these tests never import the Triton kernels and run on any CI host without
 ``triton-ascend`` / ``flash-linear-attention``.
 """
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -34,6 +36,10 @@ import pytest
 import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
 from veomni.ops.dispatch import OpSlot
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
+from veomni.ops.kernels.gated_delta_rule.npu_hardware import (
+    get_hidden_state_block_value,
+    select_hidden_state_block_value,
+)
 from veomni.utils.import_utils import is_torch_npu_available
 
 
@@ -137,3 +143,37 @@ def test_npu_ascendc_factory_missing_dep_raises_actionable():
 
     with pytest.raises(RuntimeError, match="npu_ascendc"):
         _npu_ascendc_chunk_gated_delta_rule_factory()
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910B4", "Ascend910B4-1"])
+def test_ascend_910b4_uses_bv64(device_name):
+    assert select_hidden_state_block_value(device_name) == 64
+
+
+@pytest.mark.parametrize(
+    "device_name",
+    ["Ascend910B1", "Ascend910B2", "Ascend910B2C", "Ascend910B3", "Ascend910_95", "Ascend950"],
+)
+def test_other_ascend_devices_keep_bv128(device_name):
+    assert select_hidden_state_block_value(device_name) == 128
+
+
+def test_runtime_selector_caches_by_explicit_device_index(monkeypatch):
+    calls = []
+    device_names = {0: "Ascend910B4-1", 1: "Ascend910B2C"}
+
+    def get_device_name(device_index):
+        calls.append(device_index)
+        return device_names[device_index]
+
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(npu=SimpleNamespace(get_device_name=get_device_name))
+    )
+    get_hidden_state_block_value.cache_clear()
+    try:
+        assert get_hidden_state_block_value(0) == 64
+        assert get_hidden_state_block_value(1) == 128
+        assert get_hidden_state_block_value(0) == 64
+        assert calls == [0, 1]
+    finally:
+        get_hidden_state_block_value.cache_clear()
