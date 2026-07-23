@@ -38,6 +38,13 @@ from ..utils.token_accounting import (
     document_lengths_from_position_ids,
     summarize_document_lengths,
 )
+from .source_metadata import (
+    PACKED_SOURCE_METADATA_KEY,
+    SOURCE_DIAGNOSTIC_FIELDS,
+    SOURCE_METADATA_KEY,
+    make_packed_source_metadata,
+    normalize_source_metadata,
+)
 
 
 # A model-provided hook that derives ``multimodal_metadata`` from a packed +
@@ -196,13 +203,23 @@ class MakeMicroBatchCollator(DataCollator):
     internal_data_collator: "DataCollator"
 
     def __call__(self, features: Sequence[Tuple[Dict[str, "torch.Tensor"]]]) -> List[Dict[str, "torch.Tensor"]]:
-        micro_batch_size = len(features) // self.num_micro_batch
-        for i in range(len(features)):
-            features[i] = features[i][0]  # 1-to-N inverse transform
+        unwrapped_features = []
+        for transformed_parts in features:
+            if isinstance(transformed_parts, dict):
+                unwrapped_features.append(transformed_parts)
+                continue
+            if not isinstance(transformed_parts, (list, tuple)) or len(transformed_parts) != 1:
+                raise ValueError(
+                    "Fixed-sample batching requires exactly one output per input transform; "
+                    "use dynamic batching for one-to-many transforms."
+                )
+            unwrapped_features.append(transformed_parts[0])
+
+        micro_batch_size = len(unwrapped_features) // self.num_micro_batch
 
         micro_batches = []
-        for i in range(0, len(features), micro_batch_size):
-            micro_batches.append(self.internal_data_collator(features[i : i + micro_batch_size]))
+        for i in range(0, len(unwrapped_features), micro_batch_size):
+            micro_batches.append(self.internal_data_collator(unwrapped_features[i : i + micro_batch_size]))
 
         return micro_batches
 
@@ -266,7 +283,45 @@ class PackingCollator(DataCollator):
                 )
         return batch
 
-    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def _pack_source_metadata(self, features: List[Dict[str, Any]]) -> dict | None:
+        raw_metadata = [feature.pop(SOURCE_METADATA_KEY, None) for feature in features]
+        if not any(metadata is not None for metadata in raw_metadata):
+            return None
+        if not all(metadata is not None for metadata in raw_metadata):
+            raise ValueError(f"{SOURCE_METADATA_KEY} must be present on every packed feature")
+
+        segments: list[dict[str, Any]] = []
+        packed_offset = 0
+        for sample_index, (feature, metadata) in enumerate(zip(features, raw_metadata)):
+            normalized = normalize_source_metadata(metadata)
+            position_ids = feature["position_ids"]
+            if position_ids.dim() > 1:
+                position_ids = position_ids.reshape(-1, position_ids.size(-1))[0]
+            feature_length = int(feature["input_ids"].size(-1))
+            if position_ids.numel() != feature_length:
+                raise ValueError("position_ids and input_ids must have matching sequence lengths")
+
+            reset_offsets = torch.nonzero(position_ids == 0, as_tuple=False).flatten().tolist()
+            if not reset_offsets or reset_offsets[0] != 0:
+                raise ValueError("each packed feature must start with position_ids == 0")
+            boundaries = reset_offsets + [feature_length]
+            for subsegment_index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+                segment = {
+                    "source_id": normalized["source_id"],
+                    **({"source_name": normalized["source_name"]} if "source_name" in normalized else {}),
+                    **{name: normalized[name] for name in SOURCE_DIAGNOSTIC_FIELDS if name in normalized},
+                    "segment_index": len(segments),
+                    "sample_index": sample_index,
+                    "subsegment_index": subsegment_index,
+                    "token_start": packed_offset + start,
+                    "token_length": end - start,
+                }
+                segments.append(segment)
+            packed_offset += feature_length
+        return make_packed_source_metadata(segments, valid_token_count=packed_offset)
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        packed_source_metadata = self._pack_source_metadata(features)
         batch = defaultdict(list)
         for feature in features:
             for key in feature.keys():
@@ -301,6 +356,8 @@ class PackingCollator(DataCollator):
             sequence_length = int(batch["input_ids"].shape[-1]) if "input_ids" in batch else 0
             document_stats = summarize_document_lengths([sequence_length] if sequence_length else [])
         batch[_TOKEN_ACCOUNTING_PARTIAL] = document_stats
+        if packed_source_metadata is not None:
+            batch[PACKED_SOURCE_METADATA_KEY] = packed_source_metadata
 
         linear_attn_tail_padding_length = 0
         if self.pad_to_length:
