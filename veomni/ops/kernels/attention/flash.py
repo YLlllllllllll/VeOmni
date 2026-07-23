@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 from transformers.modeling_flash_attention_utils import _flash_attention_forward as hf_flash_attention_forward
 
 from ....distributed.parallel_state import get_parallel_state
@@ -179,7 +180,12 @@ def flash_attention_forward(
        output is scattered back afterwards.  Pass ``skip_ulysses=True`` for
        sub-modules (e.g. ViT encoders) that should not participate in SP.
 
-    3. **FA backend selection** — the implementation name stored in
+    3. **Ring / Hybrid context-parallelism** — when CP is active after the
+       optional Ulysses gather, attention runs through
+       ``ringattn_context_parallel`` (and Hybrid packed reorder) instead of the
+       local flash kernel.
+
+    4. **FA backend selection** — the implementation name stored in
        ``module.config._attn_implementation`` is mapped to the token that
        Transformers' ``lazy_import_flash_attention`` expects:
 
@@ -233,9 +239,9 @@ def flash_attention_forward(
 
     # Ulysses patch
     ulysses_enabled = get_parallel_state().ulysses_enabled
+    ulysses_size = get_parallel_state().ulysses_size if ulysses_enabled else 1
     if ulysses_enabled and not skip_ulysses:
         ulysses_group = get_parallel_state().ulysses_group
-        ulysses_size = get_parallel_state().ulysses_size
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query,
             key,
@@ -254,44 +260,147 @@ def flash_attention_forward(
                 group=ulysses_group,
             )
 
-    # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
-    #
-    # FA2 and FA3 have dedicated branches in transformers' _lazy_imports, so we
-    # use the plain transformers names and they are resolved without hitting the
-    # hub-kernel path.
-    #
-    # FA4 has no such branch; unrecognised names fall through to the hub-kernel
-    # loader. By keeping the VeOmni name here, our monkey-patch of
-    # ``load_and_register_attn_kernel`` intercepts it and loads
-    # ``flash_attn.cute`` locally.
-    if module.config._attn_implementation == "veomni_flash_attention_2_with_sp":
-        fa_kernel_implementation = "flash_attention_2"
-    elif module.config._attn_implementation == "veomni_flash_attention_3_with_sp":
-        fa_kernel_implementation = "flash_attention_3"
-    elif module.config._attn_implementation == "veomni_flash_attention_4_with_sp":
-        fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
-    else:
-        raise ValueError(
-            f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
+    # Ring context-parallel attention (after optional Ulysses gather).
+    # Local sequence layout must already be balanced zigzag from the collator.
+    cp_enabled = get_parallel_state().cp_enabled and not skip_ulysses
+    # Hybrid: Ulysses gather concatenates rank-major packed shards; Ring needs
+    # sample-major CP-local order + scaled cu_seqlens (see packed_sharding).
+    _hybrid_ulysses_local_cu = None
+    if ulysses_enabled and cp_enabled and not skip_ulysses:
+        from ....distributed.context_parallel.packed_sharding import (
+            reorder_ulysses_rank_major_to_sample_major,
+            ulysses_local_cu_to_cp_local_cu,
         )
 
-    attn_output = _flash_attention_forward(
-        query,
-        key,
-        value,
-        attention_mask,
-        query_length=seq_len,
-        is_causal=is_causal,
-        dropout=dropout,
-        softmax_scale=scaling,
-        sliding_window=sliding_window,
-        softcap=softcap,
-        use_top_left_mask=False,
-        target_dtype=target_dtype,
-        attn_implementation=fa_kernel_implementation,
-        layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
-        **kwargs,
-    )
+        _hybrid_ulysses_local_cu = kwargs.get("cu_seq_lens_q")
+        if _hybrid_ulysses_local_cu is None:
+            _hybrid_ulysses_local_cu = kwargs.get("cu_seqlens_q")
+        if _hybrid_ulysses_local_cu is not None:
+            seq_dim = 1 if query.ndim == 4 else 0
+            actual = int(query.size(seq_dim))
+            local_sum = int(_hybrid_ulysses_local_cu.diff().sum().item())
+            expected = local_sum * int(ulysses_size)
+            if actual != expected:
+                # ViT passes global cu_seqlens while Q is only Ulysses-gathered
+                # (CP-local). Skip LM hybrid reorder; drop cu to avoid packed-ring OOB.
+                _hybrid_ulysses_local_cu = None
+                kwargs = dict(kwargs)
+                for _k in (
+                    "cu_seq_lens_q",
+                    "cu_seq_lens_k",
+                    "cu_seqlens_q",
+                    "cu_seqlens_k",
+                ):
+                    kwargs.pop(_k, None)
+            else:
+                query = reorder_ulysses_rank_major_to_sample_major(
+                    query, _hybrid_ulysses_local_cu, ulysses_size=ulysses_size, seq_dim=seq_dim
+                )
+                key = reorder_ulysses_rank_major_to_sample_major(
+                    key, _hybrid_ulysses_local_cu, ulysses_size=ulysses_size, seq_dim=seq_dim
+                )
+                value = reorder_ulysses_rank_major_to_sample_major(
+                    value, _hybrid_ulysses_local_cu, ulysses_size=ulysses_size, seq_dim=seq_dim
+                )
+                cp_cu = ulysses_local_cu_to_cp_local_cu(_hybrid_ulysses_local_cu, ulysses_size)
+                kwargs = dict(kwargs)
+                kwargs["cu_seq_lens_q"] = cp_cu
+                kwargs["cu_seq_lens_k"] = cp_cu
+                kwargs["cu_seqlens_q"] = cp_cu
+                kwargs["cu_seqlens_k"] = cp_cu
+                if "max_length_q" in kwargs or "max_seqlen_q" in kwargs:
+                    max_cp = int(cp_cu.diff().max().item()) if cp_cu.numel() > 1 else 0
+                    kwargs["max_length_q"] = max_cp
+                    kwargs["max_length_k"] = max_cp
+                    kwargs["max_seqlen_q"] = max_cp
+                    kwargs["max_seqlen_k"] = max_cp
+                seq_len = query.shape[1] if query.ndim == 4 else query.shape[0]
+
+    if cp_enabled:
+        from ....distributed.context_parallel.attention_backend import has_npu_fusion_attention
+        from ....distributed.context_parallel.ring_attention import ringattn_context_parallel
+
+        cu_seqlens = kwargs.get("cu_seq_lens_q")
+        if cu_seqlens is None:
+            cu_seqlens = kwargs.get("cu_seqlens_q")
+        # HF packed/varlen SFT often passes is_causal=False; Ring path is causal-only for now.
+        # Proceed with causal Ring regardless of the flag (non-causal CP is out of cut).
+        if sliding_window is not None or softcap is not None:
+            raise NotImplementedError("Ring CP does not support sliding_window/softcap yet.")
+        if dropout not in (0, 0.0):
+            raise NotImplementedError("Ring CP does not support attention dropout yet.")
+
+        query_bnsd = query.transpose(1, 2).contiguous()
+        key_bnsd = key.transpose(1, 2).contiguous()
+        value_bnsd = value.transpose(1, 2).contiguous()
+        cp_group = get_parallel_state().cp_group
+        cp_global_ranks = dist.get_process_group_ranks(cp_group)
+        backend = "npu" if has_npu_fusion_attention() and query.device.type == "npu" else "torch"
+        attn_output_bnsd = ringattn_context_parallel(
+            query_bnsd,
+            key_bnsd,
+            value_bnsd,
+            query_bnsd.shape[1],
+            cp_group,
+            cp_global_ranks,
+            softmax_scale=scaling,
+            backend=backend,
+            cu_seqlens=cu_seqlens,
+        )
+        attn_output = attn_output_bnsd.transpose(1, 2).contiguous()
+    else:
+        # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
+        #
+        # FA2 and FA3 have dedicated branches in transformers' _lazy_imports, so we
+        # use the plain transformers names and they are resolved without hitting the
+        # hub-kernel path.
+        #
+        # FA4 has no such branch; unrecognised names fall through to the hub-kernel
+        # loader. By keeping the VeOmni name here, our monkey-patch of
+        # ``load_and_register_attn_kernel`` intercepts it and loads
+        # ``flash_attn.cute`` locally.
+        if module.config._attn_implementation == "veomni_flash_attention_2_with_sp":
+            fa_kernel_implementation = "flash_attention_2"
+        elif module.config._attn_implementation == "veomni_flash_attention_3_with_sp":
+            fa_kernel_implementation = "flash_attention_3"
+        elif module.config._attn_implementation == "veomni_flash_attention_4_with_sp":
+            fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
+        else:
+            raise ValueError(
+                f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
+            )
+
+        attn_output = _flash_attention_forward(
+            query,
+            key,
+            value,
+            attention_mask,
+            query_length=seq_len,
+            is_causal=is_causal,
+            dropout=dropout,
+            softmax_scale=scaling,
+            sliding_window=sliding_window,
+            softcap=softcap,
+            use_top_left_mask=False,
+            target_dtype=target_dtype,
+            attn_implementation=fa_kernel_implementation,
+            layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
+            **kwargs,
+        )
+
+    # Hybrid inverse reorder before Ulysses scatter (rank-major packed shards).
+    if ulysses_enabled and cp_enabled and not skip_ulysses and _hybrid_ulysses_local_cu is not None:
+        from ....distributed.context_parallel.packed_sharding import (
+            reorder_sample_major_to_ulysses_rank_major,
+        )
+
+        seq_dim = 1 if attn_output.ndim == 4 else 0
+        attn_output = reorder_sample_major_to_ulysses_rank_major(
+            attn_output,
+            _hybrid_ulysses_local_cu,
+            ulysses_size=ulysses_size,
+            seq_dim=seq_dim,
+        )
 
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:
