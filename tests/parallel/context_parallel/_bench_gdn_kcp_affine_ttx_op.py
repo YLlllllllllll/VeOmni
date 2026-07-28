@@ -23,7 +23,8 @@ from pathlib import Path
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[3]
+_here = Path(__file__).resolve()
+ROOT = _here.parents[3] if len(_here.parents) > 3 else Path(".")
 if not (ROOT / "veomni" / "distributed" / "context_parallel" / "gdn_kcp.py").is_file():
     for cand in [
         Path(os.environ.get("VEOMNI_ROOT", "")),
@@ -36,6 +37,8 @@ if not (ROOT / "veomni" / "distributed" / "context_parallel" / "gdn_kcp.py").is_
             break
 CP = ROOT / "veomni" / "distributed" / "context_parallel"
 OPS_K = ROOT / "veomni" / "ops" / "kernels"
+if not (CP / "gdn_kcp.py").is_file():
+    raise SystemExit(f"cannot locate gdn_kcp.py under ROOT={ROOT}")
 
 
 def _load(name: str, path: Path, package: str):
