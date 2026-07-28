@@ -59,6 +59,37 @@ def _eye_m(num_heads: int, k_dim: int, *, device: torch.device) -> Tensor:
     return eye.view(1, k_dim, k_dim).expand(num_heads, k_dim, k_dim).contiguous()
 
 
+def _prepare_affine_inputs(
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    *,
+    cu_seqlens: Optional[Tensor],
+    use_qk_l2norm: bool,
+    eps: float,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, List[Tuple[int, int, int]]]:
+    if key.ndim != 4 or value.ndim != 4:
+        raise ValueError(f"key/value must be 4D [B,T,H,D], got {tuple(key.shape)} / {tuple(value.shape)}")
+    if use_qk_l2norm:
+        key = key * torch.rsqrt(key.pow(2).sum(dim=-1, keepdim=True) + eps)
+    k = key.float()
+    v = value.float()
+    gg = g.float()
+    bb = beta.float()
+    bsz = int(k.shape[0])
+    if cu_seqlens is None:
+        ranges = [(b, 0, int(k.shape[1])) for b in range(bsz)]
+    else:
+        if bsz != 1:
+            raise ValueError("varlen affine summary expects batch=1 packed layout")
+        pts = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
+        if not pts or pts[0] != 0:
+            raise ValueError(f"cu_seqlens must start at 0, got {pts[:3]}")
+        ranges = [(0, pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    return k, v, gg, bb, ranges
+
+
 def local_affine_summary_recurrent(
     key: Tensor,
     value: Tensor,
@@ -77,28 +108,16 @@ def local_affine_summary_recurrent(
       cu_seqlens: optional varlen boundaries on the T axis of batch 0.
 
     Returns ``hm`` with shape ``[N, H, K, V+K]`` float32.
+
+    This is the **P1.5 golden reference**. Alternate impls must match it
+    bit-close / absdiff≈0 (not the CP-C lossy tol).
     """
-    if key.ndim != 4 or value.ndim != 4:
-        raise ValueError(f"key/value must be 4D [B,T,H,D], got {tuple(key.shape)} / {tuple(value.shape)}")
-    if use_qk_l2norm:
-        key = key * torch.rsqrt(key.pow(2).sum(dim=-1, keepdim=True) + eps)
-    k = key.float()
-    v = value.float()
-    gg = g.float()
-    bb = beta.float()
-    bsz, _t, num_heads, k_dim = k.shape
+    k, v, gg, bb, ranges = _prepare_affine_inputs(
+        key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
+    )
+    num_heads = int(k.shape[2])
+    k_dim = int(k.shape[3])
     v_dim = int(v.shape[-1])
-
-    if cu_seqlens is None:
-        ranges = [(b, 0, int(k.shape[1])) for b in range(bsz)]
-    else:
-        if bsz != 1:
-            raise ValueError("varlen affine summary expects batch=1 packed layout")
-        pts = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
-        if not pts or pts[0] != 0:
-            raise ValueError(f"cu_seqlens must start at 0, got {pts[:3]}")
-        ranges = [(0, pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
-
     eye = _eye_m(num_heads, k_dim, device=k.device)
     out = []
     for _b, start, end in ranges:
@@ -117,6 +136,104 @@ def local_affine_summary_recurrent(
             M = torch.einsum("hki,hij->hkj", M_step, M)
         out.append(pack_affine_hm(he, M))
     return torch.stack(out, dim=0)
+
+
+def local_affine_summary_fused_torch(
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    *,
+    cu_seqlens: Optional[Tensor] = None,
+    use_qk_l2norm: bool = True,
+    eps: float = 1e-6,
+) -> Tensor:
+    """P1.5a: same LTR fp32 recurrence as eager, head-batched ``bmm`` form.
+
+    Still O(T) sequential (associativity not reordered — required for bit-close
+    vs eager). Reduces Python/einsum overhead; Ascend Mojo fused loop is P1.5b.
+    INV-7: all state stays float32.
+    """
+    k, v, gg, bb, ranges = _prepare_affine_inputs(
+        key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
+    )
+    num_heads = int(k.shape[2])
+    k_dim = int(k.shape[3])
+    v_dim = int(v.shape[-1])
+    eye = _eye_m(num_heads, k_dim, device=k.device)
+    out = []
+    for _b, start, end in ranges:
+        # Contiguous time slices for fewer indexing ops.
+        kt_all = k[_b, start:end].contiguous()  # [T,H,K]
+        vt_all = v[_b, start:end].contiguous()
+        eg_all = gg[_b, start:end].exp().contiguous()
+        bt_all = bb[_b, start:end].contiguous()
+        he = torch.zeros(num_heads, k_dim, v_dim, device=k.device, dtype=torch.float32)
+        M = eye.clone()
+        for t in range(int(kt_all.shape[0])):
+            eg = eg_all[t]
+            kt = kt_all[t]
+            vt = vt_all[t]
+            bt = bt_all[t]
+            outer = kt.unsqueeze(-1) * kt.unsqueeze(-2)
+            M_step = eg[:, None, None] * (eye - bt[:, None, None] * outer)
+            he_step = (bt[:, None] * kt).unsqueeze(-1) * vt.unsqueeze(-2)
+            # bmm over heads: [H,K,K] @ [H,K,V] / [H,K,K]
+            he = torch.bmm(M_step, he) + he_step
+            M = torch.bmm(M_step, M)
+        out.append(pack_affine_hm(he, M))
+    return torch.stack(out, dim=0)
+
+
+def resolve_local_affine_impl(name: Optional[str] = None) -> str:
+    """Select local pre-scan impl. Default ``eager`` (golden)."""
+    key = (name if name is not None else os.environ.get("VEOMNI_GDN_KCP_AFFINE_IMPL", "")).strip().lower()
+    if key in ("", "eager", "recurrent", "golden"):
+        return "eager"
+    if key in ("fused_torch", "fused", "vectorized", "torch"):
+        return "fused_torch"
+    if key in ("mojo",):
+        return "mojo"
+    raise ValueError(
+        f"Unknown VEOMNI_GDN_KCP_AFFINE_IMPL={name!r}. "
+        "Expected one of: eager, fused_torch, mojo."
+    )
+
+
+def local_affine_summary(
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    *,
+    cu_seqlens: Optional[Tensor] = None,
+    use_qk_l2norm: bool = True,
+    eps: float = 1e-6,
+    impl: Optional[str] = None,
+) -> Tensor:
+    """Dispatch local affine summary. Scope lock: only this function is P1.5-swappable."""
+    kind = resolve_local_affine_impl(impl)
+    if kind == "eager":
+        return local_affine_summary_recurrent(
+            key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
+        )
+    if kind == "fused_torch":
+        return local_affine_summary_fused_torch(
+            key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
+        )
+    # mojo: first landing — try extension hook, else fail closed (no silent fallback).
+    try:
+        from veomni.ops.kernels.gdn_kcp_affine import mojo_local_affine_summary  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "VEOMNI_GDN_KCP_AFFINE_IMPL=mojo requested but "
+            "veomni.ops.kernels.gdn_kcp_affine.mojo_local_affine_summary is unavailable. "
+            "Use eager (golden) or fused_torch until the Ascend Mojo kernel lands. "
+            f"import_error={exc}"
+        ) from exc
+    return mojo_local_affine_summary(
+        key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
+    )
 
 
 def prefix_merge_initial_state(
@@ -262,7 +379,7 @@ def resolve_kcp_initial_state(
             dtype=torch.float32,
         )
     else:
-        local_hm = local_affine_summary_recurrent(
+        local_hm = local_affine_summary(
             key,
             value,
             g,
@@ -300,9 +417,12 @@ def assert_kcp_comm_bytes_independent_of_seq(
 __all__ = [
     "all_gather_affine_hm",
     "assert_kcp_comm_bytes_independent_of_seq",
+    "local_affine_summary",
+    "local_affine_summary_fused_torch",
     "local_affine_summary_recurrent",
     "pack_affine_hm",
     "prefix_merge_initial_state",
     "resolve_kcp_initial_state",
+    "resolve_local_affine_impl",
     "unpack_affine_hm",
 ]
