@@ -185,6 +185,21 @@ def local_affine_summary_fused_torch(
     return torch.stack(out, dim=0)
 
 
+def ensure_affine_hm_fp32(hm: Tensor, *, where: str = "kcp") -> Tensor:
+    """INV-7 belt: force ``hm`` to float32 before all-gather / merge.
+
+    Kernel-internal bf16 is allowed; communication/state buffers are not.
+    Silent bf16 AG is the serial v6 byte-misalign NaN class — fail closed.
+    """
+    if hm.dtype != torch.float32:
+        hm = hm.float().contiguous()
+    if hm.dtype != torch.float32:
+        raise RuntimeError(f"INV-7 ({where}): hm must be float32 before AG, got {hm.dtype}")
+    if not torch.isfinite(hm).all():
+        raise RuntimeError(f"INV-7 ({where}): refusing non-finite hm before AG")
+    return hm
+
+
 def resolve_local_affine_impl(name: Optional[str] = None) -> str:
     """Select local pre-scan impl. Default ``eager`` (golden)."""
     key = (name if name is not None else os.environ.get("VEOMNI_GDN_KCP_AFFINE_IMPL", "")).strip().lower()
@@ -221,19 +236,20 @@ def local_affine_summary(
         return local_affine_summary_fused_torch(
             key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
         )
-    # mojo: first landing — try extension hook, else fail closed (no silent fallback).
+    # mojo: bf16-internal → fp32 hm (ACCEPTABLE_LOSSY vs eager; not bit-close).
     try:
-        from veomni.ops.kernels.gdn_kcp_affine import mojo_local_affine_summary  # type: ignore
+        from veomni.ops.kernels.gdn_kcp_affine import mojo_local_affine_summary
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
             "VEOMNI_GDN_KCP_AFFINE_IMPL=mojo requested but "
             "veomni.ops.kernels.gdn_kcp_affine.mojo_local_affine_summary is unavailable. "
-            "Use eager (golden) or fused_torch until the Ascend Mojo kernel lands. "
+            "Use eager (golden) or fused_torch (bit-close). "
             f"import_error={exc}"
         ) from exc
-    return mojo_local_affine_summary(
+    hm = mojo_local_affine_summary(
         key, value, g, beta, cu_seqlens=cu_seqlens, use_qk_l2norm=use_qk_l2norm, eps=eps
     )
+    return ensure_affine_hm_fp32(hm, where="mojo_local_affine_summary")
 
 
 def prefix_merge_initial_state(
@@ -388,6 +404,9 @@ def resolve_kcp_initial_state(
             use_qk_l2norm=use_qk_l2norm,
         )
 
+    # INV-7: fp32-cast-before-AG — mandatory for all impls (esp. mojo bf16 compute).
+    local_hm = ensure_affine_hm_fp32(local_hm, where="resolve_kcp_initial_state")
+
     ag_hm = all_gather_affine_hm(
         local_hm, cp_group=cp_group, cp_size=cp_size, cp_rank=cp_rank
     )
@@ -417,6 +436,7 @@ def assert_kcp_comm_bytes_independent_of_seq(
 __all__ = [
     "all_gather_affine_hm",
     "assert_kcp_comm_bytes_independent_of_seq",
+    "ensure_affine_hm_fp32",
     "local_affine_summary",
     "local_affine_summary_fused_torch",
     "local_affine_summary_recurrent",
