@@ -21,6 +21,9 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from . import flash, flex
 from .flash import (
+    # Compat: byted veomni_patch still does
+    # ``attention._flash_attention_forward = ...`` at import time.
+    _flash_attention_forward,
     flash_attention_forward,
     patch_transformers_hub_kernel_loader_for_veomni,
 )

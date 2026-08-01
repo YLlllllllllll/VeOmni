@@ -19,10 +19,6 @@ from typing import Dict, Optional
 import torch
 import torch_npu
 
-# Load-bearing despite being unused: importing fla_npu registers the fused
-# torch.ops.npu.* GDN ops this file dispatches to. Do not prune.
-import fla_npu  # noqa: F401
-
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton.cumsum import chunk_local_cumsum
@@ -37,6 +33,28 @@ else:
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
 _DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
+_FLA_NPU_LOADED = False
+
+
+def _ensure_fla_npu() -> None:
+    """Import fla_npu only when AscendC fused GDN ops are about to run.
+
+    ``precompute_varlen_metadata`` is pure host metadata and is also imported by
+    the mojo GDN path; a top-level ``import fla_npu`` would break that path when
+    fla_npu is not installed in the image/venv.
+    """
+    global _FLA_NPU_LOADED
+    if _FLA_NPU_LOADED:
+        return
+    try:
+        import fla_npu  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "AscendC chunk gated delta rule requires fla_npu to register "
+            "torch.ops.npu.* GDN kernels. Install fla_npu on this NPU image, "
+            "or select chunk_gated_delta_rule_implementation=mojo|eager|npu."
+        ) from e
+    _FLA_NPU_LOADED = True
 
 
 def cdiv_torch(a, b):
@@ -179,6 +197,7 @@ def flash_chunk_gated_delta_rule_fwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu()
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -281,6 +300,7 @@ def flash_chunk_gated_delta_rule_bwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu()
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
 
@@ -556,6 +576,7 @@ def flash_gated_delta_rule(
         o: [B, T, H, V]
         final_state: [N, H, K, V] when output_final_state=True, else None
     """
+    _ensure_fla_npu()
     if q.dtype != k.dtype or k.dtype != v.dtype:
         raise ValueError(
             f"q current type is {q.dtype}, k current type is {k.dtype}, "

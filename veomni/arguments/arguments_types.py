@@ -877,7 +877,24 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert acc.cp_size == 1, "Context parallel size not supported yet."
+        # Ring / Hybrid / KCP context parallel is supported via
+        # ``VEOMNI_GDN_CP_IMPL`` (see veomni.distributed.context_parallel).
+        # Keep tp/pp gated; allow cp_size > 1 for GDN CP lanes.
+        if acc.cp_size != 1:
+            _cp_impl = os.getenv("VEOMNI_GDN_CP_IMPL", "").strip().lower()
+            if _cp_impl not in {
+                "kcp",
+                "ring",
+                "hybrid",
+                "state_passing_serial",
+                "1",
+                "true",
+            }:
+                raise AssertionError(
+                    "Context parallel size not supported yet. "
+                    "Set VEOMNI_GDN_CP_IMPL=kcp|ring|hybrid|state_passing_serial "
+                    f"to enable cp_size={acc.cp_size}."
+                )
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
