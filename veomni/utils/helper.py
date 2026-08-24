@@ -108,7 +108,8 @@ def spawn_npu_offline_sidecar(
     """Fire-and-forget offline Ascend postprocess so training is not blocked.
 
     The sidecar runs in a new session so it can outlive a soft train shutdown.
-    Logs go to ``<raw_dir>/veomni_npu_offline_postprocess.log``.
+    Logs go to a sibling ``<raw_dir>.veomni_npu_offline_postprocess.log`` so
+    the sidecar never mutates the raw tree while copying it.
     """
     cmd = [sys.executable, "-m", "veomni.utils.npu_offline_postprocess", "--raw-dir", raw_dir]
     if copy_to:
@@ -124,10 +125,8 @@ def spawn_npu_offline_sidecar(
         logger.warning("spawn_npu_offline_sidecar called with nothing to do; skipping")
         return None
 
-    log_path = os.path.join(
-        raw_dir if os.path.isdir(raw_dir) else os.path.dirname(raw_dir) or ".",
-        "veomni_npu_offline_postprocess.log",
-    )
+    raw_path = os.path.abspath(os.path.expanduser(raw_dir))
+    log_path = f"{raw_path}.veomni_npu_offline_postprocess.log"
     log_fh = None
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)

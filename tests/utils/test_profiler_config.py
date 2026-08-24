@@ -221,6 +221,26 @@ def test_npu_sidecar_log_setup_failure_is_nonfatal(monkeypatch, tmp_path):
     assert any("disk full" in warning for warning in warnings)
 
 
+def test_npu_sidecar_log_is_a_sibling_of_raw_capture(monkeypatch, tmp_path):
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+    popen_calls = []
+
+    monkeypatch.setattr(
+        helper.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (popen_calls.append((args, kwargs)), SimpleNamespace(pid=123))[1],
+    )
+
+    proc = helper.spawn_npu_offline_sidecar(str(raw_dir), analyse=True)
+
+    assert proc.pid == 123
+    log_path = tmp_path / "rank0_ascend_pt.veomni_npu_offline_postprocess.log"
+    assert log_path.is_file()
+    assert not (raw_dir / "veomni_npu_offline_postprocess.log").exists()
+    assert popen_calls[0][1]["stdout"].name == str(log_path)
+
+
 def test_npu_sidecar_platform_upload_prefers_trial_in_child_env(monkeypatch, tmp_path):
     raw_dir = tmp_path / "rank0_ascend_pt"
     raw_dir.mkdir()

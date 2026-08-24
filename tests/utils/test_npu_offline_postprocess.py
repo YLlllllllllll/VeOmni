@@ -31,6 +31,10 @@ def test_resolve_raw_dir_accepts_ascend_pt(tmp_path):
 def test_resolve_raw_dir_finds_unique_child(tmp_path):
     raw = tmp_path / "localhost_1_2_ascend_pt"
     raw.mkdir()
+    (tmp_path / "localhost_1_2_ascend_pt.veomni_npu_offline_postprocess.log").write_text(
+        "sidecar",
+        encoding="utf-8",
+    )
     assert post.resolve_raw_dir(tmp_path) == raw.resolve()
 
 
@@ -174,6 +178,248 @@ def test_copy_raw_dir_refuses_existing_hdfs_target(tmp_path, monkeypatch):
         post.copy_raw_dir(raw, "hdfs://haruna/profile")
 
     assert copies == []
+
+
+def test_wait_for_raw_dir_stable_requires_prof_end_marker_and_restarts_quiet_window(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    profile = raw / "PROF_000001_capture"
+    host = profile / "host"
+    host.mkdir(parents=True)
+    payload = profile / "raw.bin"
+    payload.write_bytes(b"first")
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            if self.now == 1.0:
+                (host / "end_info.done").touch()
+            elif self.now == 2.0:
+                payload.write_bytes(b"second")
+
+    clock = _Clock()
+    monkeypatch.setattr(post.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(post.time, "sleep", clock.sleep)
+
+    snapshot = post.wait_for_raw_dir_stable(
+        raw,
+        timeout_seconds=10.0,
+        stable_seconds=2.0,
+        poll_interval_seconds=1.0,
+    )
+
+    assert clock.now == 4.0
+    assert snapshot == post.snapshot_raw_dir(raw)
+    assert any(entry[0] == "PROF_000001_capture/host/end_info.done" for entry in snapshot)
+
+
+def test_wait_for_raw_dir_stable_requires_all_prof_markers(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    first_host = raw / "PROF_000001_capture" / "host"
+    second_host = raw / "PROF_000002_capture" / "host"
+    first_host.mkdir(parents=True)
+    second_host.mkdir(parents=True)
+    (first_host / "end_info.done").touch()
+    (raw / "PROF_000001_capture" / "raw.bin").write_bytes(b"first")
+    (raw / "PROF_000002_capture" / "raw.bin").write_bytes(b"second")
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            if self.now == 2.0:
+                (second_host / "end_info.done").touch()
+
+    clock = _Clock()
+    monkeypatch.setattr(post.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(post.time, "sleep", clock.sleep)
+
+    post.wait_for_raw_dir_stable(
+        raw,
+        timeout_seconds=10.0,
+        stable_seconds=1.0,
+        poll_interval_seconds=1.0,
+    )
+
+    assert clock.now == 3.0
+
+
+def test_wait_for_raw_dir_stable_times_out_without_end_marker(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    raw.mkdir()
+    (raw / "raw.bin").write_bytes(b"profile")
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = _Clock()
+    monkeypatch.setattr(post.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(post.time, "sleep", clock.sleep)
+
+    with pytest.raises(TimeoutError, match=r"2\.0s.*host/end_info\.done"):
+        post.wait_for_raw_dir_stable(
+            raw,
+            timeout_seconds=2.0,
+            stable_seconds=1.0,
+            poll_interval_seconds=0.5,
+        )
+
+
+def test_snapshot_raw_dir_tracks_legacy_sidecar_log_mutation(tmp_path):
+    raw = tmp_path / "rank0_ascend_pt"
+    host = raw / "host"
+    host.mkdir(parents=True)
+    (host / "end_info.done").touch()
+    (raw / "raw.bin").write_bytes(b"profile")
+    log = raw / post.SIDECAR_LOG_BASENAME
+    log.write_text("first", encoding="utf-8")
+
+    before = post.snapshot_raw_dir(raw)
+    log.write_text("second", encoding="utf-8")
+
+    assert post.snapshot_raw_dir(raw) != before
+    assert any(entry[0] == post.SIDECAR_LOG_BASENAME for entry in before)
+
+
+def test_copy_raw_dir_refuses_source_that_changed_after_readiness(tmp_path):
+    raw = tmp_path / "rank0_ascend_pt"
+    raw.mkdir()
+    payload = raw / "raw.bin"
+    payload.write_bytes(b"first")
+    expected = post.snapshot_raw_dir(raw)
+    payload.write_bytes(b"second")
+    destination = tmp_path / "durable"
+
+    with pytest.raises(RuntimeError, match="changed after the readiness barrier"):
+        post.copy_raw_dir(raw, str(destination), expected_snapshot=expected)
+
+    assert not destination.exists()
+
+
+def test_copy_raw_dir_detects_source_mutation_during_hdfs_copy_without_publishing_target(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    raw.mkdir()
+    payload = raw / "raw.bin"
+    payload.write_bytes(b"first")
+    expected = post.snapshot_raw_dir(raw)
+
+    monkeypatch.setattr(hdfs_io, "exists", lambda _path: False)
+    monkeypatch.setattr(hdfs_io, "makedirs", lambda *_args, **_kwargs: None)
+    published = []
+    monkeypatch.setattr(post, "_publish_hdfs_staging", lambda *args: published.append(args))
+
+    def mutate_during_copy(*_args):
+        payload.write_bytes(b"second")
+        return True
+
+    monkeypatch.setattr(hdfs_io, "copy", mutate_during_copy)
+
+    with pytest.raises(RuntimeError, match="changed while copying to HDFS"):
+        post.copy_raw_dir(
+            raw,
+            "hdfs://haruna/profile",
+            expected_snapshot=expected,
+        )
+
+    assert published == []
+
+
+def test_copy_raw_dir_stages_then_publishes_hdfs_target(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    raw.mkdir()
+    (raw / "raw.bin").write_bytes(b"profile")
+    expected = post.snapshot_raw_dir(raw)
+    copies = []
+    published = []
+
+    monkeypatch.setattr(hdfs_io, "exists", lambda _path: False)
+    monkeypatch.setattr(hdfs_io, "makedirs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hdfs_io, "copy", lambda *args: (copies.append(args), True)[1])
+    monkeypatch.setattr(post, "_publish_hdfs_staging", lambda *args: published.append(args))
+
+    post.copy_raw_dir(raw, "hdfs://haruna/profile", expected_snapshot=expected)
+
+    assert len(copies) == 1
+    assert copies[0][0] == str(raw)
+    assert copies[0][1].startswith("hdfs://haruna/profile/.rank0_ascend_pt.incomplete-")
+    assert published == [(copies[0][1], "hdfs://haruna/profile/rank0_ascend_pt")]
+
+
+def test_postprocess_waits_for_stability_before_copy_and_analyse(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    raw.mkdir()
+    events = []
+    (raw / "raw.bin").write_bytes(b"profile")
+    stable_snapshot = post.snapshot_raw_dir(raw)
+
+    monkeypatch.setattr(
+        post,
+        "wait_for_raw_dir_stable",
+        lambda *args, **kwargs: (events.append(("wait", args, kwargs)), stable_snapshot)[1],
+    )
+    monkeypatch.setattr(
+        post,
+        "copy_raw_dir",
+        lambda *args, **kwargs: events.append(("copy", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        post,
+        "run_analyse",
+        lambda *args, **kwargs: events.append(("analyse", args, kwargs)),
+    )
+
+    post.postprocess(
+        raw,
+        copy_to="hdfs://haruna/profile",
+        analyse=True,
+        raw_ready_timeout_seconds=12.0,
+        raw_stable_seconds=3.0,
+        raw_poll_interval_seconds=0.5,
+    )
+
+    assert [event[0] for event in events] == ["wait", "copy", "analyse"]
+    assert events[0][2] == {
+        "timeout_seconds": 12.0,
+        "stable_seconds": 3.0,
+        "poll_interval_seconds": 0.5,
+    }
+    assert events[1][2] == {"expected_snapshot": stable_snapshot}
+
+
+def test_postprocess_refuses_analysis_when_source_changes_after_copy_returns(tmp_path, monkeypatch):
+    raw = tmp_path / "rank0_ascend_pt"
+    raw.mkdir()
+    payload = raw / "raw.bin"
+    payload.write_bytes(b"first")
+    stable_snapshot = post.snapshot_raw_dir(raw)
+    analysed = []
+
+    monkeypatch.setattr(post, "wait_for_raw_dir_stable", lambda *args, **kwargs: stable_snapshot)
+
+    def mutate_after_copy(*_args, **_kwargs):
+        payload.write_bytes(b"second")
+
+    monkeypatch.setattr(post, "copy_raw_dir", mutate_after_copy)
+    monkeypatch.setattr(post, "run_analyse", lambda *args, **kwargs: analysed.append((args, kwargs)))
+
+    with pytest.raises(RuntimeError, match="changed before analysis"):
+        post.postprocess(raw, copy_to="hdfs://haruna/profile", analyse=True)
+
+    assert analysed == []
 
 
 def test_gzip_and_merlin_upload_cmd(tmp_path, monkeypatch):

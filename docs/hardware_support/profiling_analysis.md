@@ -90,7 +90,7 @@ python -m veomni.utils.npu_offline_postprocess \
 
 If only a platform file uploader is available, pass it explicitly with `--upload-cmd '<command>'` instead.
 
-Sidecar logs are written next to the raw directory as `veomni_npu_offline_postprocess.log`. Sidecar startup, analysis, or upload failures never fall back to synchronous work in the distributed barrier; the raw capture remains available for recovery.
+Sidecar logs are written as a sibling named `<raw_dir>.veomni_npu_offline_postprocess.log`; they are never placed inside the recursively copied raw capture. Before copy or analysis, the sidecar waits for every `PROF_*/host/end_info.done` marker (with the legacy root-level layout also supported) and an unchanged raw tree for a bounded quiet window. Copies are staged and only published after the source is revalidated. A readiness timeout fails closed without copying or analysing partial data. Sidecar startup, analysis, or upload failures never fall back to synchronous work in the distributed barrier; the raw capture remains available for recovery.
 NPU profiler initialization, raw finalization, and cleanup failures are also non-fatal: the failing rank disables further profiling, every rank still leaves the paired barrier, and training continues.
 
 For distributed Ascend training, use the following options together:
