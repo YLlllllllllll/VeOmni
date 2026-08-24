@@ -17,7 +17,7 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -112,6 +112,10 @@ class OptimizerConfig:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    betas: Tuple[float, float] = field(
+        default=(0.9, 0.95),
+        metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
@@ -1163,15 +1167,19 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp"] = field(
-        default="disabled",
-        metadata={
-            "help": "Context-parallel algorithm selector. 'disabled' (default) uses generic Ring/Hybrid CP for "
-            "non-GDN causal models and rejects CP at Qwen3.5 GDN model binding; "
-            "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
-            "autograd across context-parallel ranks; 'kcp' reuses the same lossless ownership/halo layout and "
-            "replaces recurrent-state P2P with the fixed-size TTX BC8/M1 affine-prefix collective on Ascend."
-        },
+    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp", "headwise_lossless"] = (
+        field(
+            default="disabled",
+            metadata={
+                "help": "Context-parallel algorithm selector. 'disabled' (default) uses generic Ring/Hybrid CP for "
+                "non-GDN causal models and rejects CP at Qwen3.5 GDN model binding; "
+                "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
+                "autograd across context-parallel ranks; 'kcp' reuses the same lossless ownership/halo layout and "
+                "replaces recurrent-state P2P with the fixed-size TTX BC8/M1 affine-prefix collective on Ascend; "
+                "'headwise_lossless' gathers each packed sequence once over the flattened CP x Ulysses group and "
+                "shards GDN heads without recurrent-state communication."
+            },
+        )
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
@@ -1190,7 +1198,7 @@ class OpsImplementationConfig:
     )
 
     def __post_init__(self):
-        allowed_gdn_cp = {"disabled", "kcp", "state_passing_lossless"}
+        allowed_gdn_cp = {"disabled", "kcp", "state_passing_lossless", "headwise_lossless"}
         if self.gdn_context_parallel_implementation not in allowed_gdn_cp:
             raise ValueError(
                 "gdn_context_parallel_implementation must be one of "
@@ -1333,30 +1341,6 @@ class ModelArguments:
             "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
         },
     )
-    foundation: Dict[str, str] = field(
-        default_factory=dict,
-        metadata={"help": "Foundation model extra config."},
-    )
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal encoder config and weights."},
-    )
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config and weights."},
-    )
-    input_encoder: Literal["encoder", "decoder"] = field(
-        default="encoder",
-        metadata={"help": "Use encoder to encode input images or use decoder.encoder to encode input images."},
-    )
-    output_encoder: Literal["encoder", "decoder"] = field(
-        default="decoder",
-        metadata={"help": "Use encoder to encode output images or use decoder.encoder to encode output images."},
-    )
-    encode_target: bool = field(
-        default=False,
-        metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
-    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -1376,10 +1360,6 @@ class ModelArguments:
         self.model_path = _resolve_hdfs_path(self.model_path)
         self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-        for sub_args in (*self.encoders.values(), *self.decoders.values()):
-            for key in ("model_path", "config_path", "tokenizer_path"):
-                if sub_args.get(key) is not None:
-                    sub_args[key] = _resolve_hdfs_path(sub_args[key])
 
         if self.config_path is None:
             self.config_path = self.model_path
@@ -1403,32 +1383,6 @@ class ModelArguments:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
-
-        suppoerted_encoder_types = ["image", "video", "audio"]
-        for encoder_type, encoder_args in self.encoders.items():
-            if encoder_type not in suppoerted_encoder_types:
-                raise ValueError(
-                    f"Unsupported encoder type: {encoder_type}. Should be one of {suppoerted_encoder_types}."
-                )
-
-            if encoder_args.get("config_path") is None and encoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if encoder_args.get("config_path") is None:
-                encoder_args["config_path"] = encoder_args["model_path"]
-
-        supported_decoder_types = ["image"]
-        for decoder_type, decoder_args in self.decoders.items():
-            if decoder_type not in supported_decoder_types:
-                raise ValueError(
-                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
-                )
-
-            if decoder_args.get("config_path") is None and decoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if decoder_args.get("config_path") is None:
-                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 # ================================ Data Arguments ======================================
@@ -1629,7 +1583,7 @@ def validate_context_parallel_config(
     selector for non-GDN causal models. Qwen3.5 GDN is never allowed to
     silently fall back to Ring: it must select an explicit lossless selector.
     """
-    enabled_gdn_cp = {"kcp", "state_passing_lossless"}
+    enabled_gdn_cp = {"kcp", "state_passing_lossless", "headwise_lossless"}
     supported_cp = enabled_gdn_cp | {"disabled"}
     if implementation not in supported_cp:
         raise ValueError(
@@ -1655,7 +1609,7 @@ def validate_context_parallel_config(
     if implementation == "disabled" and model_type in _GDN_CP_MODEL_TYPES:
         raise ValueError(
             "Qwen3.5 GDN context parallelism requires explicit "
-            "gdn_context_parallel_implementation='state_passing_lossless' or 'kcp'."
+            "gdn_context_parallel_implementation='state_passing_lossless', 'kcp', or 'headwise_lossless'."
         )
     if implementation in enabled_gdn_cp and model_type not in _GDN_CP_MODEL_TYPES:
         raise ValueError(

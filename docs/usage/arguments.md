@@ -133,12 +133,6 @@ Root config — assembles `model`, `data`, and `train`.
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
-| foundation | `Dict[str, str]` | `{}` | Foundation model extra config. |
-| encoders | `Dict` | `{}` | Multimodal encoder configs keyed by modality (`image`, `video`, `audio`). |
-| decoders | `Dict` | `{}` | Multimodal decoder configs keyed by modality (`image`). |
-| input_encoder | `Literal["encoder", "decoder"]` | `"encoder"` | Whether to use the encoder or decoder to encode input images. |
-| output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
-| encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
@@ -199,7 +193,7 @@ NPU validation runs at two times:
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
-| gdn_context_parallel_implementation | `Literal["disabled", "state_passing_lossless", "kcp"]` | `"disabled"` | Context-parallel algorithm selector for the current Ascend-NPU-only CP release. `disabled` disables only the GDN-specific state-passing/KCP algorithm; when `cp_size > 1`, it selects generic Ring/Hybrid CP for non-GDN causal models and does not disable CP itself. `state_passing_lossless` uses native-chunk ownership, reversible all-to-all, and autograd-aware recurrent-state/halo P2P. `kcp` keeps the same lossless ownership/halo layout but replaces recurrent-state P2P with the fixed-size `ttx_bc8_m1` affine-prefix collective. CPU execution is reserved for correctness oracles, and CUDA CP is not supported. Qwen3.5 must select an explicit lossless mode; it never silently falls back to generic Ring. |
+| gdn_context_parallel_implementation | `Literal["disabled", "state_passing_lossless", "kcp", "headwise_lossless"]` | `"disabled"` | Context-parallel algorithm selector for the current Ascend-NPU-only CP release. `disabled` disables only the GDN-specific algorithm; when `cp_size > 1`, it selects generic Ring/Hybrid CP for non-GDN causal models and does not disable CP itself. `state_passing_lossless` uses native-chunk ownership, reversible all-to-all, and autograd-aware recurrent-state/halo P2P. `kcp` keeps the same lossless ownership/halo layout but replaces recurrent-state P2P with the fixed-size `ttx_bc8_m1` affine-prefix collective. `headwise_lossless` evaluates GDN exactly after one packed sequence→head A2A over flattened CP×Ulysses and restores physical tokens with one inverse A2A. CPU execution is reserved for correctness oracles, and CUDA CP is not supported. Qwen3.5 must select an explicit lossless mode; it never silently falls back to generic Ring. |
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
@@ -366,10 +360,8 @@ not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
 10 steps; set `interval=1` for per-step metrics. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
-a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
-because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
-is unsupported because it packs source alignment metadata after the common step
-lifecycle. In DPO training, only the policy-model forward is observed; the
+a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
+alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
 reference-model forward is excluded, and the chosen/rejected segments both use
 their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
@@ -439,7 +431,7 @@ validation instead of applying ChunkMBS to multiple stacks.
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
-| cp_size | `int` | `1` | Context-parallel size. The current production CP release supports Ascend NPU only; CPU execution is reserved for correctness oracles, and CUDA CP is not supported. For non-GDN causal models, `cp_size > 1` with `gdn_context_parallel_implementation="disabled"` uses generic Ring/Hybrid CP. Qwen3.5 dense/MoE text-only packed causal-LM training instead requires `state_passing_lossless` or `kcp`; it never falls back to generic Ring. CP requires packed dynamic batches, FlashAttention-2/3/4 dispatch, zero dropout, no sliding window, and a power-of-two size. |
+| cp_size | `int` | `1` | Context-parallel size. The current production CP release supports Ascend NPU only; CPU execution is reserved for correctness oracles, and CUDA CP is not supported. For non-GDN causal models, `cp_size > 1` with `gdn_context_parallel_implementation="disabled"` uses generic Ring/Hybrid CP. Qwen3.5 dense/MoE text-only packed causal-LM training instead requires `state_passing_lossless`, `kcp`, or `headwise_lossless`; it never falls back to generic Ring. CP requires packed dynamic batches, FlashAttention-2/3/4 dispatch, zero dropout, no sliding window, and a power-of-two size. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 
