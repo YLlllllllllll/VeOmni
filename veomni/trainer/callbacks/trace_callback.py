@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import os
 import time
 from collections import Counter
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List
 
 import torch.distributed as dist
@@ -39,6 +41,62 @@ def _gdn_cp_runtime_trace_steps() -> int:
     if not raw.isdecimal():
         raise ValueError("VEOMNI_GDN_CP_RUNTIME_TRACE_STEPS must be a non-negative base-10 integer")
     return int(raw)
+
+
+def _persist_gdn_cp_runtime_trace(trace: dict[str, Any], directory: str | os.PathLike[str]) -> dict[str, Any]:
+    """Atomically publish one rank-local CP trace without any synchronization.
+
+    The merged stdout of multi-rank launchers is not a structured transport:
+    long JSON records can interleave at byte granularity.  A unique local file
+    per rank and optimizer step keeps the evidence off the communication path
+    and lets an external gate validate completeness after training.
+    """
+
+    rank = trace.get("global_rank")
+    step = trace.get("global_step")
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+        raise ValueError(f"global_rank must be a non-negative integer, got {rank!r}")
+    if isinstance(step, bool) or not isinstance(step, int) or step <= 0:
+        raise ValueError(f"global_step must be a positive integer, got {step!r}")
+
+    root = Path(directory)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = (json.dumps(trace, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    destination = root / f"step_{step:08d}_rank_{rank:05d}.json"
+    temporary = root / f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as error:
+            raise RuntimeError(f"GDN CP runtime trace artifact already exists: {destination}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "bytes": len(payload),
+        "global_rank": rank,
+        "global_step": step,
+        "sha256": digest,
+    }
+
+
+def _emit_gdn_cp_runtime_trace(trace: dict[str, Any]) -> None:
+    directory = os.environ.get("VEOMNI_GDN_CP_RUNTIME_TRACE_DIR")
+    if not directory:
+        # Backward compatibility for ad-hoc debugging. Canonical gates should
+        # set TRACE_DIR and treat rank-local artifacts as the source of truth.
+        print("VEOMNI_GDN_CP_RUNTIME_TRACE", json.dumps(trace, sort_keys=True), flush=True)
+        return
+
+    reference = _persist_gdn_cp_runtime_trace(trace, directory)
+    line = "VEOMNI_GDN_CP_RUNTIME_TRACE_REF " + json.dumps(reference, sort_keys=True, separators=(",", ":")) + "\n"
+    encoded = line.encode("utf-8")
+    if len(encoded) >= 4096:
+        raise RuntimeError(f"GDN CP runtime trace reference exceeds the atomic stdout budget: {len(encoded)} bytes")
+    os.write(1, encoded)
 
 
 def _snapshot_gdn_cp_runtime_observers(model: Any) -> dict[str, Any]:
@@ -81,8 +139,9 @@ def _collect_gdn_cp_runtime_trace(
     The model-side observer deliberately does not print or synchronize.  This
     callback is the generic diagnostics consumer: it runs after backward, so
     both forward and backward collective counters are visible.  Each rank
-    prints its own compact record; an external gate can then prove that all CP
-    ranks participated without adding a training-time collective here.
+    emits its own compact record (stdout by default, or a rank-local artifact
+    when configured); an external gate can then prove that all CP ranks
+    participated without adding a training-time collective here.
     """
 
     from ...distributed.context_parallel.gdn_runtime import GdnCpOperation, GdnCpPhase
@@ -681,7 +740,7 @@ class EnvironMeterCallback(Callback):
                     "topology": _validate_gdn_cp_runtime_topology(runtime_trace, self.parallel_state),
                 }
             )
-            print("VEOMNI_GDN_CP_RUNTIME_TRACE", json.dumps(runtime_trace, sort_keys=True), flush=True)
+            _emit_gdn_cp_runtime_trace(runtime_trace)
 
         step_env_metrics.update(step_train_metrics)
 

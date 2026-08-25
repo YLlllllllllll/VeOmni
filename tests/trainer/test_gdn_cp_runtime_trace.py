@@ -1,3 +1,6 @@
+import hashlib
+import json
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -226,3 +229,74 @@ def test_gdn_cp_runtime_trace_rejects_cp1_and_missing_observers():
     model = _ObservedLayer(_state_observer(cp_size=1, cp_rank=0))
     with pytest.raises(RuntimeError, match="requires a real CP topology"):
         trace_callback._collect_gdn_cp_runtime_trace(model)
+
+
+def test_gdn_cp_runtime_trace_persists_one_private_atomic_artifact(tmp_path):
+    trace = {
+        "global_rank": 6,
+        "global_step": 1,
+        "identity": {"implementation": "state_passing_lossless"},
+        "observers": [{"module": "layers.0"}],
+    }
+
+    reference = trace_callback._persist_gdn_cp_runtime_trace(trace, tmp_path)
+
+    artifact = tmp_path / "step_00000001_rank_00006.json"
+    assert reference == {
+        "bytes": artifact.stat().st_size,
+        "global_rank": 6,
+        "global_step": 1,
+        "sha256": reference["sha256"],
+    }
+    assert len(reference["sha256"]) == 64
+    assert reference["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert json.loads(artifact.read_text(encoding="utf-8")) == trace
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("global_rank", True), ("global_rank", -1), ("global_step", True), ("global_step", 0)],
+)
+def test_gdn_cp_runtime_trace_artifact_rejects_invalid_identity(tmp_path, field, value):
+    trace = {"global_rank": 0, "global_step": 1}
+    trace[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        trace_callback._persist_gdn_cp_runtime_trace(trace, tmp_path)
+
+
+def test_gdn_cp_runtime_trace_artifact_refuses_to_overwrite_prior_attempt(tmp_path):
+    trace = {"global_rank": 0, "global_step": 1}
+    trace_callback._persist_gdn_cp_runtime_trace(trace, tmp_path)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        trace_callback._persist_gdn_cp_runtime_trace(trace, tmp_path)
+
+
+def test_gdn_cp_runtime_trace_emits_short_reference_when_artifact_dir_is_set(monkeypatch, tmp_path, capfd):
+    trace = {"global_rank": 2, "global_step": 1, "observers": [{"module": "layers.0"}]}
+    monkeypatch.setenv("VEOMNI_GDN_CP_RUNTIME_TRACE_DIR", str(tmp_path))
+
+    trace_callback._emit_gdn_cp_runtime_trace(trace)
+
+    output = capfd.readouterr().out
+    prefix = "VEOMNI_GDN_CP_RUNTIME_TRACE_REF "
+    assert output.startswith(prefix)
+    assert len(output.encode("utf-8")) < 4096
+    reference = json.loads(output.removeprefix(prefix))
+    assert reference["global_rank"] == 2
+    assert reference["global_step"] == 1
+    assert (tmp_path / "step_00000001_rank_00002.json").is_file()
+
+
+def test_gdn_cp_runtime_trace_keeps_legacy_stdout_without_artifact_dir(monkeypatch, capsys):
+    trace = {"global_rank": 2, "global_step": 1}
+    monkeypatch.delenv("VEOMNI_GDN_CP_RUNTIME_TRACE_DIR", raising=False)
+
+    trace_callback._emit_gdn_cp_runtime_trace(trace)
+
+    output = capsys.readouterr().out
+    assert output.startswith("VEOMNI_GDN_CP_RUNTIME_TRACE ")
+    assert json.loads(output.split(" ", 1)[1]) == trace
