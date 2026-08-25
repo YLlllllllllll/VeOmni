@@ -1083,8 +1083,11 @@ if _TRITON_OK:
 
         output_offset = (t0_abs + ti) * H + i_h
         tl.store(grad_k_ptr + output_offset * K + offs_k, dk, mask=mask_k)
-        tl.store(grad_g_ptr + output_offset, dg)
-        tl.store(grad_b_ptr + output_offset, db)
+        # Ascend Triton requires scalar values for scalar pointers.  The
+        # accumulators are intentionally one-element blocks, so reduce them
+        # explicitly before the final writeback.
+        tl.store(grad_g_ptr + output_offset, tl.sum(dg))
+        tl.store(grad_b_ptr + output_offset, tl.sum(db))
 
 
 def _triton_analytical_bwd(
