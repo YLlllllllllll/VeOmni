@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import json
+import os
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List
 
 import torch.distributed as dist
@@ -30,6 +32,261 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
+
+
+def _gdn_cp_runtime_trace_steps() -> int:
+    raw = os.environ.get("VEOMNI_GDN_CP_RUNTIME_TRACE_STEPS", "0")
+    if not raw.isdecimal():
+        raise ValueError("VEOMNI_GDN_CP_RUNTIME_TRACE_STEPS must be a non-negative base-10 integer")
+    return int(raw)
+
+
+def _snapshot_gdn_cp_runtime_observers(model: Any) -> dict[str, Any]:
+    snapshots = {}
+    for module_name, module in model.named_modules():
+        observer = getattr(module, "gdn_cp_runtime_evidence", None)
+        if observer is not None:
+            snapshots[module_name] = observer.snapshot()
+    return snapshots
+
+
+def _require_balanced_gdn_cp_collective(
+    counts: Counter[tuple[str, str, str]],
+    operation: Any,
+    phase: Any,
+    *,
+    observer_name: str | None = None,
+) -> None:
+    key = (operation.value, phase.value)
+    enter = counts[(*key, "enter")]
+    exit_count = counts[(*key, "exit")]
+    errors = counts[(*key, "error")]
+    if enter <= 0 or enter != exit_count or errors:
+        scope = "" if observer_name is None else f" (per-observer observer={observer_name!r})"
+        raise RuntimeError(
+            f"GDN CP runtime trace missing a balanced collective{scope}: "
+            f"operation={operation.value} phase={phase.value} "
+            f"enter={enter} exit={exit_count} error={errors}"
+        )
+
+
+def _collect_gdn_cp_runtime_trace(
+    model: Any,
+    *,
+    snapshots: dict[str, Any] | None = None,
+    previous_snapshots: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect post-backward evidence from every live GDN CP observer.
+
+    The model-side observer deliberately does not print or synchronize.  This
+    callback is the generic diagnostics consumer: it runs after backward, so
+    both forward and backward collective counters are visible.  Each rank
+    prints its own compact record; an external gate can then prove that all CP
+    ranks participated without adding a training-time collective here.
+    """
+
+    from ...distributed.context_parallel.gdn_runtime import GdnCpOperation, GdnCpPhase
+
+    snapshots = _snapshot_gdn_cp_runtime_observers(model) if snapshots is None else snapshots
+    if not snapshots:
+        raise RuntimeError("GDN CP runtime trace found no live context-parallel observers")
+    previous_snapshots = {} if previous_snapshots is None else previous_snapshots
+    if previous_snapshots and snapshots.keys() != previous_snapshots.keys():
+        raise RuntimeError(
+            "GDN CP runtime trace observer set changed between optimizer steps: "
+            f"previous={sorted(previous_snapshots)} current={sorted(snapshots)}"
+        )
+
+    identity_keys = {
+        (
+            snapshot.identity.implementation,
+            snapshot.identity.ownership_plan_hash,
+            snapshot.identity.cp_size,
+            snapshot.identity.cp_rank,
+            snapshot.identity.layout,
+            snapshot.identity.affine_backend,
+        )
+        for snapshot in snapshots.values()
+    }
+    if len(identity_keys) != 1:
+        raise RuntimeError(f"GDN CP runtime trace found inconsistent layer identities: {sorted(identity_keys)!r}")
+    implementation, plan_hash, cp_size, cp_rank, layout, affine_backend = next(iter(identity_keys))
+    if cp_size <= 1:
+        raise RuntimeError(f"GDN CP runtime trace requires a real CP topology, got cp_size={cp_size}")
+    if any(not snapshot.balanced for snapshot in snapshots.values()):
+        raise RuntimeError("GDN CP runtime trace found an unbalanced or failed collective")
+
+    counts: Counter[tuple[str, str, str]] = Counter()
+    observed_cp_ranks: set[int] = set()
+    observer_records = []
+    for module_name, snapshot in snapshots.items():
+        previous = previous_snapshots.get(module_name)
+        if previous is not None and previous.identity != snapshot.identity:
+            raise RuntimeError(f"GDN CP runtime trace identity changed for observer {module_name!r}")
+        previous_counts = {
+            (event.operation, event.phase, state): getattr(event, state)
+            for event in (() if previous is None else previous.events)
+            for state in ("enter", "exit", "error")
+        }
+        observer_counts: Counter[tuple[str, str, str]] = Counter()
+        observed_cp_ranks.update(snapshot.observed_cp_ranks)
+        for event in snapshot.events:
+            for state in ("enter", "exit", "error"):
+                key = (event.operation, event.phase, state)
+                delta = getattr(event, state) - previous_counts.get(key, 0)
+                if delta < 0:
+                    raise RuntimeError(
+                        f"GDN CP runtime trace counter regressed for observer={module_name!r} key={key!r}"
+                    )
+                observer_counts[key] = delta
+                counts[key] += delta
+
+        for phase in (GdnCpPhase.FORWARD, GdnCpPhase.BACKWARD):
+            _require_balanced_gdn_cp_collective(
+                observer_counts, GdnCpOperation.OWNERSHIP_A2A, phase, observer_name=module_name
+            )
+        if implementation == "state_passing_lossless":
+            for phase in (GdnCpPhase.FORWARD, GdnCpPhase.BACKWARD):
+                if cp_rank > 0:
+                    _require_balanced_gdn_cp_collective(
+                        observer_counts, GdnCpOperation.STATE_P2P_RECV, phase, observer_name=module_name
+                    )
+                    _require_balanced_gdn_cp_collective(
+                        observer_counts, GdnCpOperation.HALO_P2P_RECV, phase, observer_name=module_name
+                    )
+                if cp_rank + 1 < cp_size:
+                    _require_balanced_gdn_cp_collective(
+                        observer_counts, GdnCpOperation.STATE_P2P_SEND, phase, observer_name=module_name
+                    )
+                    _require_balanced_gdn_cp_collective(
+                        observer_counts, GdnCpOperation.HALO_P2P_SEND, phase, observer_name=module_name
+                    )
+            for operation in (GdnCpOperation.KCP_AFFINE_READY, GdnCpOperation.KCP_AFFINE_AG):
+                if any(
+                    observer_counts[(operation.value, phase.value, state)]
+                    for phase in GdnCpPhase
+                    for state in ("enter", "exit", "error")
+                ):
+                    raise RuntimeError(f"state_passing_lossless unexpectedly executed {operation.value}")
+        elif implementation == "kcp":
+            if previous is None:
+                _require_balanced_gdn_cp_collective(
+                    observer_counts,
+                    GdnCpOperation.KCP_AFFINE_READY,
+                    GdnCpPhase.FORWARD,
+                    observer_name=module_name,
+                )
+            _require_balanced_gdn_cp_collective(
+                observer_counts, GdnCpOperation.KCP_AFFINE_AG, GdnCpPhase.FORWARD, observer_name=module_name
+            )
+            _require_balanced_gdn_cp_collective(
+                observer_counts, GdnCpOperation.KCP_AFFINE_AG, GdnCpPhase.BACKWARD, observer_name=module_name
+            )
+            for phase in (GdnCpPhase.FORWARD, GdnCpPhase.BACKWARD):
+                if cp_rank > 0:
+                    _require_balanced_gdn_cp_collective(
+                        observer_counts, GdnCpOperation.HALO_P2P_RECV, phase, observer_name=module_name
+                    )
+                if cp_rank + 1 < cp_size:
+                    _require_balanced_gdn_cp_collective(
+                        observer_counts, GdnCpOperation.HALO_P2P_SEND, phase, observer_name=module_name
+                    )
+            for operation in (GdnCpOperation.STATE_P2P_RECV, GdnCpOperation.STATE_P2P_SEND):
+                if any(
+                    observer_counts[(operation.value, phase.value, state)]
+                    for phase in GdnCpPhase
+                    for state in ("enter", "exit", "error")
+                ):
+                    raise RuntimeError(f"kcp unexpectedly executed {operation.value}")
+        else:
+            raise RuntimeError(f"GDN CP runtime trace does not recognize implementation {implementation!r}")
+
+        observer_records.append(
+            {
+                "module": module_name,
+                "operations": [
+                    {
+                        "operation": operation,
+                        "phase": phase,
+                        "enter": observer_counts[(operation, phase, "enter")],
+                        "exit": observer_counts[(operation, phase, "exit")],
+                        "error": observer_counts[(operation, phase, "error")],
+                    }
+                    for operation, phase in sorted({(operation, phase) for operation, phase, _ in observer_counts})
+                ],
+                "balanced": True,
+            }
+        )
+
+    for phase in (GdnCpPhase.FORWARD, GdnCpPhase.BACKWARD):
+        _require_balanced_gdn_cp_collective(counts, GdnCpOperation.OWNERSHIP_A2A, phase)
+
+    operations = [
+        {
+            "operation": operation,
+            "phase": phase,
+            "enter": counts[(operation, phase, "enter")],
+            "exit": counts[(operation, phase, "exit")],
+            "error": counts[(operation, phase, "error")],
+        }
+        for operation, phase in sorted({(operation, phase) for operation, phase, _ in counts})
+    ]
+    return {
+        "identity": {
+            "implementation": implementation,
+            "ownership_plan_hash": plan_hash,
+            "cp_size": cp_size,
+            "cp_rank": cp_rank,
+            "layout": layout,
+            "affine_backend": affine_backend,
+        },
+        "observer_count": len(snapshots),
+        "observers": observer_records,
+        "observed_cp_ranks": sorted(observed_cp_ranks),
+        "operations": operations,
+        "balanced": True,
+    }
+
+
+def _validate_gdn_cp_runtime_topology(trace: dict[str, Any], parallel_state: Any) -> dict[str, int]:
+    """Match observer identity against the live CP/Ulysses process groups."""
+
+    import torch.distributed as dist
+
+    identity = trace["identity"]
+    if not parallel_state.cp_enabled or parallel_state.cp_group is None:
+        raise RuntimeError("GDN CP runtime trace requires an initialized CP process group")
+    if parallel_state.sp_group is None:
+        raise RuntimeError("GDN CP runtime trace requires an initialized flattened SP process group")
+    topology = {
+        "cp_size": dist.get_world_size(parallel_state.cp_group),
+        "cp_rank": dist.get_rank(parallel_state.cp_group),
+        "ulysses_size": parallel_state.ulysses_size,
+        "ulysses_rank": parallel_state.ulysses_rank,
+        "sp_size": parallel_state.sp_size,
+        "sp_rank": dist.get_rank(parallel_state.sp_group),
+    }
+    if parallel_state.ulysses_enabled:
+        if parallel_state.ulysses_group is None:
+            raise RuntimeError("GDN CP runtime trace requires an initialized Ulysses process group")
+        topology["ulysses_group_size"] = dist.get_world_size(parallel_state.ulysses_group)
+        topology["ulysses_rank"] = dist.get_rank(parallel_state.ulysses_group)
+    topology["sp_group_size"] = dist.get_world_size(parallel_state.sp_group)
+    expected = {
+        "cp_size": parallel_state.cp_size,
+        "ulysses_group_size": parallel_state.ulysses_size,
+        "sp_group_size": parallel_state.sp_size,
+    }
+    for field, value in expected.items():
+        if field in topology and topology[field] != value:
+            raise RuntimeError(f"GDN CP runtime trace topology mismatch: {field}={topology[field]} expected={value}")
+    if identity["cp_size"] != topology["cp_size"] or identity["cp_rank"] != topology["cp_rank"]:
+        raise RuntimeError(
+            "GDN CP observer identity differs from the live process group: "
+            f"observer=({identity['cp_size']},{identity['cp_rank']}) "
+            f"live=({topology['cp_size']},{topology['cp_rank']})"
+        )
+    return topology
 
 
 class MoERouterMonitorCallback(Callback):
@@ -360,6 +617,7 @@ class EnvironMeterCallback(Callback):
             gc_steps=args.train.gc_steps,
             parallel_state=self.parallel_state,
         )
+        self._gdn_cp_runtime_previous_snapshots: dict[str, Any] = {}
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
@@ -406,6 +664,24 @@ class EnvironMeterCallback(Callback):
             )
             if args.train.global_rank == 0:
                 print("VEOMNI_GRAD_PARITY_TRACE", json.dumps(grad_parity_trace, sort_keys=True), flush=True)
+
+        runtime_trace_steps = _gdn_cp_runtime_trace_steps()
+        if 0 < state.global_step <= runtime_trace_steps:
+            runtime_snapshots = _snapshot_gdn_cp_runtime_observers(self.trainer.model)
+            runtime_trace = _collect_gdn_cp_runtime_trace(
+                self.trainer.model,
+                snapshots=runtime_snapshots,
+                previous_snapshots=self._gdn_cp_runtime_previous_snapshots,
+            )
+            self._gdn_cp_runtime_previous_snapshots = runtime_snapshots
+            runtime_trace.update(
+                {
+                    "global_rank": args.train.global_rank,
+                    "global_step": state.global_step,
+                    "topology": _validate_gdn_cp_runtime_topology(runtime_trace, self.parallel_state),
+                }
+            )
+            print("VEOMNI_GDN_CP_RUNTIME_TRACE", json.dumps(runtime_trace, sort_keys=True), flush=True)
 
         step_env_metrics.update(step_train_metrics)
 
