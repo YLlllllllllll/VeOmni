@@ -21,23 +21,17 @@ def test_gdn_cp_selector_rejects_unknown_value():
 
 
 @pytest.mark.parametrize("implementation", ["state_passing_lossless", "kcp"])
-def test_lossless_gdn_cp_rejects_ascendc_without_initial_state_gradient(implementation):
-    with pytest.raises(ValueError, match="does not implement that gradient"):
-        OpsImplementationConfig(
-            gdn_context_parallel_implementation=implementation,
-            chunk_gated_delta_rule_implementation="npu_ascendc",
-        )
+def test_removed_gdn_cp_selectors_fail_closed(implementation):
+    with pytest.raises(ValueError, match="gdn_context_parallel_implementation must be one of"):
+        OpsImplementationConfig(gdn_context_parallel_implementation=implementation)
 
 
 @pytest.mark.parametrize(
     ("cp_size", "implementation", "dyn_bsz", "message"),
     [
-        (1, "state_passing_lossless", True, "requires train.accelerator.cp_size > 1"),
-        (1, "kcp", True, "requires train.accelerator.cp_size > 1"),
-        (2, "state_passing_lossless", False, "requires train.dyn_bsz=True"),
-        (2, "kcp", False, "requires train.dyn_bsz=True"),
-        (3, "state_passing_lossless", True, "requires cp_size to be a power of two"),
-        (3, "kcp", True, "requires cp_size to be a power of two"),
+        (1, "headwise_lossless", True, "requires train.accelerator.cp_size > 1"),
+        (2, "headwise_lossless", False, "requires train.dyn_bsz=True"),
+        (3, "headwise_lossless", True, "requires cp_size to be a power of two"),
     ],
 )
 def test_root_config_fails_closed_before_runtime(cp_size, implementation, dyn_bsz, message):
@@ -55,9 +49,8 @@ def test_root_config_fails_closed_before_runtime(cp_size, implementation, dyn_bs
         VeOmniArguments.__post_init__(arguments)
 
 
-@pytest.mark.parametrize("implementation", ["state_passing_lossless", "kcp"])
-def test_root_config_accepts_typed_gdn_cp_implementations(implementation):
-    validate_gdn_context_parallel_config(cp_size=2, implementation=implementation, dyn_bsz=True)
+def test_root_config_accepts_headwise_gdn_cp():
+    validate_gdn_context_parallel_config(cp_size=2, implementation="headwise_lossless", dyn_bsz=True)
 
 
 def test_generic_ring_context_parallel_uses_disabled_selector_for_non_gdn_models():
@@ -106,7 +99,7 @@ def test_combined_cp_ulysses_malformed_sp_mesh_fails_closed():
         _ = state.sp_rank
 
 
-@pytest.mark.parametrize("implementation", ["disabled", "state_passing_lossless", "kcp"])
+@pytest.mark.parametrize("implementation", ["disabled", "headwise_lossless"])
 def test_context_parallel_rejects_cuda_topology_before_mesh_initialization(implementation):
     with pytest.raises(NotImplementedError, match="supported on Ascend NPU only"):
         ParallelState(
@@ -166,7 +159,7 @@ def test_gdn_context_parallel_rejects_attention_without_ring_dispatch(attention)
     with pytest.raises(ValueError, match="requires a VeOmni FlashAttention SP backend"):
         validate_context_parallel_config(
             cp_size=2,
-            implementation="state_passing_lossless",
+            implementation="headwise_lossless",
             dyn_bsz=True,
             attn_implementation=attention,
             data_type="conversation",
@@ -178,7 +171,7 @@ def test_gdn_context_parallel_rejects_model_without_patched_capability():
     with pytest.raises(ValueError, match="implemented only for Qwen3.5"):
         validate_context_parallel_config(
             cp_size=2,
-            implementation="state_passing_lossless",
+            implementation="headwise_lossless",
             dyn_bsz=True,
             attn_implementation="veomni_flash_attention_2_with_sp",
             data_type="conversation",
@@ -198,7 +191,7 @@ def test_gdn_context_parallel_rejects_model_without_patched_capability():
 def test_gdn_context_parallel_rejects_unsupported_attention_contract(override, message):
     contract = {
         "cp_size": 2,
-        "implementation": "state_passing_lossless",
+        "implementation": "headwise_lossless",
         "dyn_bsz": True,
         "attn_implementation": "veomni_flash_attention_2_with_sp",
         "data_type": "conversation",
@@ -212,11 +205,10 @@ def test_gdn_context_parallel_rejects_unsupported_attention_contract(override, m
         validate_context_parallel_config(**contract)
 
 
-@pytest.mark.parametrize("implementation", ["state_passing_lossless", "kcp"])
-def test_gdn_context_parallel_accepts_explicit_supported_contract(implementation):
+def test_gdn_context_parallel_accepts_explicit_supported_contract():
     validate_context_parallel_config(
         cp_size=8,
-        implementation=implementation,
+        implementation="headwise_lossless",
         dyn_bsz=True,
         attn_implementation="veomni_flash_attention_4_with_sp",
         data_type="conversation",
