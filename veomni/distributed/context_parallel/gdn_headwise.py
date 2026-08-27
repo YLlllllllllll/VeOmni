@@ -24,7 +24,8 @@ there is no recurrent-state approximation or duplicated local recurrence.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from numbers import Integral
 from typing import Sequence
 
@@ -32,8 +33,6 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
-
-from .sharding import balanced_cp_restore, balanced_cp_to_rank_major
 
 
 @dataclass(frozen=True)
@@ -65,6 +64,7 @@ class GdnHeadwiseLayout:
     input_specs: tuple[_HeadwiseTensorSpec, ...]
     dtype: torch.dtype
     device_type: str
+    compact_to_rank_major_index: Tensor = field(compare=False, repr=False)
 
     @property
     def ulysses_size(self) -> int:
@@ -97,6 +97,43 @@ class _EqualSplitAllToAll(torch.autograd.Function):
         grad_input = torch.empty_like(send)
         dist.all_to_all_single(grad_input, send, group=ctx.group)
         return grad_input, None
+
+
+class _GatherCanonicalTokens(torch.autograd.Function):
+    """Apply one unique token permutation without atomic gradient adds."""
+
+    @staticmethod
+    def forward(ctx, tensor: Tensor, index: Tensor) -> Tensor:
+        ctx.input_sequence_length = int(tensor.size(1))
+        ctx.save_for_backward(index)
+        return tensor.index_select(1, index)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
+        (index,) = ctx.saved_tensors
+        shape = list(grad_output.shape)
+        shape[1] = ctx.input_sequence_length
+        grad_input = grad_output.new_zeros(shape)
+        grad_input.index_copy_(1, index, grad_output)
+        return grad_input, None
+
+
+class _ScatterCanonicalTokens(torch.autograd.Function):
+    """Apply the exact transpose of :class:`_GatherCanonicalTokens`."""
+
+    @staticmethod
+    def forward(ctx, tensor: Tensor, index: Tensor, output_sequence_length: int) -> Tensor:
+        ctx.save_for_backward(index)
+        shape = list(tensor.shape)
+        shape[1] = output_sequence_length
+        output = tensor.new_zeros(shape)
+        output.index_copy_(1, index, tensor)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None, None]:
+        (index,) = ctx.saved_tensors
+        return grad_output.index_select(1, index), None, None
 
 
 def _require_coordinate(value: int, *, name: str, upper: int | None = None) -> int:
@@ -141,6 +178,72 @@ def _normalize_dims(tensor: Tensor, sequence_dim: int, head_dim: int) -> tuple[i
     return sequence_dim, head_dim
 
 
+def _rank_major_gather_points(
+    *,
+    cp_size: int,
+    world_size: int,
+    valid_lengths: tuple[int, ...],
+    padded_lengths: tuple[int, ...],
+    local_lengths: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Map canonical compact tokens to the received rank-major sequence."""
+
+    local_sequence_length = sum(local_lengths)
+    local_sample_offset = 0
+    gather_points: list[int] = []
+    for valid_length, padded_length, local_length in zip(
+        valid_lengths,
+        padded_lengths,
+        local_lengths,
+        strict=True,
+    ):
+        if padded_length:
+            rank_major_sample = [
+                source_rank * local_sequence_length + local_sample_offset + local_token
+                for source_rank in range(world_size)
+                for local_token in range(local_length)
+            ]
+            chunk_length = padded_length // (2 * cp_size)
+            rank_major_chunks = [
+                rank_major_sample[offset : offset + chunk_length] for offset in range(0, padded_length, chunk_length)
+            ]
+            canonical_chunks: list[list[int] | None] = [None] * (2 * cp_size)
+            for cp_rank in range(cp_size):
+                canonical_chunks[cp_rank] = rank_major_chunks[2 * cp_rank]
+                canonical_chunks[2 * cp_size - cp_rank - 1] = rank_major_chunks[2 * cp_rank + 1]
+            canonical_sample = [point for chunk in canonical_chunks for point in chunk or ()]
+            gather_points.extend(canonical_sample[:valid_length])
+        local_sample_offset += local_length
+
+    if len(gather_points) != sum(valid_lengths):
+        raise RuntimeError("GDN headwise token permutation has the wrong compact length")
+    if len(set(gather_points)) != len(gather_points):
+        raise RuntimeError("GDN headwise token permutation contains duplicate physical tokens")
+    total_padded_tokens = sum(padded_lengths)
+    if any(point < 0 or point >= total_padded_tokens for point in gather_points):
+        raise RuntimeError("GDN headwise token permutation contains an out-of-range physical token")
+    return tuple(gather_points)
+
+
+@lru_cache(maxsize=8)
+def _cached_rank_major_gather_index(
+    device: str,
+    cp_size: int,
+    world_size: int,
+    valid_lengths: tuple[int, ...],
+    padded_lengths: tuple[int, ...],
+    local_lengths: tuple[int, ...],
+) -> Tensor:
+    points = _rank_major_gather_points(
+        cp_size=cp_size,
+        world_size=world_size,
+        valid_lengths=valid_lengths,
+        padded_lengths=padded_lengths,
+        local_lengths=local_lengths,
+    )
+    return torch.tensor(points, dtype=torch.int64, device=torch.device(device))
+
+
 def _local_layout(
     inputs: tuple[Tensor, ...],
     *,
@@ -180,8 +283,8 @@ def _local_layout(
                 f"input {index} local sequence length {int(tensor.size(current_sequence_dim))} "
                 f"does not match packed metadata {local_sequence_length}"
             )
-        if tensor.dtype != dtype or tensor.device.type != device_type:
-            raise ValueError("all GDN headwise inputs must share dtype and device type")
+        if tensor.dtype != dtype or tensor.device != first.device:
+            raise ValueError("all GDN headwise inputs must share dtype and device")
         canonical = tensor.movedim((current_sequence_dim, current_head_dim), (1, 2))
         total_heads = int(canonical.size(2))
         if total_heads <= 0 or total_heads % world_size:
@@ -221,6 +324,14 @@ def _local_layout(
         input_specs=tuple(specs),
         dtype=dtype,
         device_type=device_type,
+        compact_to_rank_major_index=_cached_rank_major_gather_index(
+            str(first.device),
+            cp_size,
+            world_size,
+            valid_lengths,
+            padded_lengths,
+            local_lengths,
+        ),
     )
 
 
@@ -293,47 +404,39 @@ def _assert_live_layout(layout: GdnHeadwiseLayout, group: ProcessGroup) -> None:
         raise RuntimeError("GDN headwise layout is bound to a different process group")
 
 
-def _rank_major_to_sample_major(tensor: Tensor, layout: GdnHeadwiseLayout) -> Tensor:
-    rank_blocks = tensor.split(layout.local_sequence_length, dim=1)
-    per_sample: list[list[Tensor]] = [[] for _ in layout.local_lengths]
-    for rank_block in rank_blocks:
-        for sample_index, piece in enumerate(rank_block.split(layout.local_lengths, dim=1)):
-            per_sample[sample_index].append(piece)
-    pieces = [torch.cat(sample_pieces, dim=1) for sample_pieces in per_sample]
-    return torch.cat(pieces, dim=1) if pieces else tensor.narrow(1, 0, 0)
+def _pack_destination_major(inputs: Sequence[Tensor], layout: GdnHeadwiseLayout) -> Tensor:
+    """Pack all features directly into the single A2A send buffer."""
 
-
-def _sample_major_to_rank_major(tensor: Tensor, layout: GdnHeadwiseLayout) -> Tensor:
-    samples = tensor.split(layout.padded_lengths, dim=1)
-    per_rank: list[list[Tensor]] = [[] for _ in range(layout.world_size)]
-    for sample, local_length in zip(samples, layout.local_lengths):
-        for rank, piece in enumerate(sample.split(local_length, dim=1)):
-            per_rank[rank].append(piece)
-    rank_blocks = [torch.cat(pieces, dim=1) for pieces in per_rank]
-    return torch.cat(rank_blocks, dim=1) if rank_blocks else tensor.narrow(1, 0, 0)
-
-
-def _restore_and_compact(tensor: Tensor, layout: GdnHeadwiseLayout) -> Tensor:
-    sample_major = _rank_major_to_sample_major(tensor, layout)
-    samples = sample_major.split(layout.padded_lengths, dim=1)
-    valid_samples: list[Tensor] = []
-    for sample, valid_length in zip(samples, layout.valid_lengths):
-        canonical = balanced_cp_restore(sample, cp_size=layout.cp_size, dim=1)
-        valid_samples.append(canonical.narrow(1, 0, valid_length))
-    return torch.cat(valid_samples, dim=1) if valid_samples else sample_major.narrow(1, 0, 0)
-
-
-def _expand_and_to_rank_major(tensor: Tensor, layout: GdnHeadwiseLayout) -> Tensor:
-    samples = tensor.split(layout.valid_lengths, dim=1)
-    padded_samples: list[Tensor] = []
-    for sample, valid_length, padded_length in zip(samples, layout.valid_lengths, layout.padded_lengths):
-        if padded_length > valid_length:
-            shape = list(sample.shape)
-            shape[1] = padded_length - valid_length
-            sample = torch.cat((sample, sample.new_zeros(shape)), dim=1)
-        padded_samples.append(balanced_cp_to_rank_major(sample, cp_size=layout.cp_size, dim=1))
-    sample_major = torch.cat(padded_samples, dim=1) if padded_samples else tensor.narrow(1, 0, 0)
-    return _sample_major_to_rank_major(sample_major, layout)
+    total_width = sum(spec.local_width for spec in layout.input_specs)
+    send = inputs[0].new_empty(
+        layout.world_size,
+        layout.batch_size,
+        layout.local_sequence_length,
+        total_width,
+    )
+    offset = 0
+    for canonical, spec in zip(inputs, layout.input_specs, strict=True):
+        source = canonical.reshape(
+            layout.batch_size,
+            layout.local_sequence_length,
+            layout.world_size,
+            spec.local_heads,
+            *spec.tail_shape,
+        ).permute(2, 0, 1, 3, *range(4, 4 + len(spec.tail_shape)))
+        target = send.narrow(-1, offset, spec.local_width).view(
+            layout.world_size,
+            layout.batch_size,
+            layout.local_sequence_length,
+            spec.local_heads,
+            *spec.tail_shape,
+        )
+        target.copy_(source)
+        offset += spec.local_width
+    return send.reshape(
+        layout.world_size * layout.batch_size,
+        layout.local_sequence_length,
+        total_width,
+    )
 
 
 def prepare_gdn_headwise_inputs(
@@ -365,12 +468,12 @@ def prepare_gdn_headwise_inputs(
 
     canonical_inputs: list[Tensor] = []
     for tensor, spec in zip(inputs, layout.input_specs):
-        canonical = tensor.movedim((spec.sequence_dim, spec.head_dim), (1, 2)).contiguous()
+        canonical = tensor.movedim((spec.sequence_dim, spec.head_dim), (1, 2))
         expected_shape = (layout.batch_size, layout.local_sequence_length, spec.total_heads, *spec.tail_shape)
         if (
             tuple(canonical.shape) != expected_shape
             or tensor.dtype != layout.dtype
-            or tensor.device.type != layout.device_type
+            or tensor.device != layout.compact_to_rank_major_index.device
         ):
             raise RuntimeError("live GDN headwise input differs from its compiled layout")
         canonical_inputs.append(canonical)
@@ -385,34 +488,18 @@ def prepare_gdn_headwise_inputs(
         )
         return prepared, layout
 
-    packed_features: list[Tensor] = []
-    for canonical, spec in zip(canonical_inputs, layout.input_specs):
-        # Expose the destination head rank as the equal-split leading
-        # dimension.  This replaces ``5 * world_size`` device-side slice
-        # copies with one packed concatenation per GDN layer.
-        destination_major = canonical.reshape(
-            layout.batch_size,
-            layout.local_sequence_length,
-            layout.world_size,
-            spec.local_heads,
-            *spec.tail_shape,
-        ).permute(2, 0, 1, 3, *range(4, 4 + len(spec.tail_shape)))
-        packed_features.append(
-            destination_major.reshape(
-                layout.world_size * layout.batch_size,
-                layout.local_sequence_length,
-                spec.local_width,
-            )
-        )
-    send = torch.cat(packed_features, dim=-1).contiguous()
+    send = _pack_destination_major(canonical_inputs, layout)
     received = _EqualSplitAllToAll.apply(send, group)
-    rank_major = (
-        received.reshape(layout.world_size, layout.batch_size, layout.local_sequence_length, -1)
-        .permute(1, 0, 2, 3)
-        .reshape(layout.batch_size, layout.total_padded_tokens, -1)
-        .contiguous()
-    )
-    compact = _restore_and_compact(rank_major, layout)
+    if layout.batch_size == 1:
+        rank_major = received.reshape(1, layout.total_padded_tokens, -1)
+    else:
+        rank_major = (
+            received.reshape(layout.world_size, layout.batch_size, layout.local_sequence_length, -1)
+            .permute(1, 0, 2, 3)
+            .reshape(layout.batch_size, layout.total_padded_tokens, -1)
+            .contiguous()
+        )
+    compact = _GatherCanonicalTokens.apply(rank_major, layout.compact_to_rank_major_index)
 
     prepared: list[Tensor] = []
     offset = 0
@@ -449,11 +536,20 @@ def restore_gdn_headwise_output(
         restored = canonical.new_empty(full_shape) + canonical.sum() * 0
         return restored.movedim((1, 2), (sequence_dim, head_dim)).contiguous()
 
-    rank_major = _expand_and_to_rank_major(canonical, layout)
-    rank_blocks = rank_major.split(layout.local_sequence_length, dim=1)
-    send = torch.cat(
-        [block.reshape(layout.batch_size, layout.local_sequence_length, -1) for block in rank_blocks], dim=0
-    ).contiguous()
+    rank_major = _ScatterCanonicalTokens.apply(
+        canonical,
+        layout.compact_to_rank_major_index,
+        layout.total_padded_tokens,
+    )
+    if layout.batch_size == 1:
+        send = rank_major.reshape(layout.world_size, layout.local_sequence_length, -1)
+    else:
+        send = (
+            rank_major.reshape(layout.batch_size, layout.world_size, layout.local_sequence_length, -1)
+            .permute(1, 0, 2, 3)
+            .reshape(layout.world_size * layout.batch_size, layout.local_sequence_length, -1)
+            .contiguous()
+        )
     received = _EqualSplitAllToAll.apply(send, group)
     restored = (
         received.reshape(layout.world_size, layout.batch_size, layout.local_sequence_length, local_heads, *tail_shape)

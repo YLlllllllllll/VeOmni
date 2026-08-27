@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from veomni.distributed.context_parallel.gdn_headwise import (
+    compile_gdn_headwise_layout,
     prepare_gdn_headwise_inputs,
     restore_gdn_headwise_output,
 )
@@ -554,6 +555,50 @@ def _run_asymmetric_metadata_contract(rank: int, world_size: int) -> None:
     assert collectives.list == 0
 
 
+def _run_compiled_token_permutation_contract(rank: int, world_size: int) -> None:
+    cu_seqlens = torch.tensor([0, 0, 5, 14], dtype=torch.int32)
+    valid_inputs = _valid_inputs(int(cu_seqlens[-1]))
+    physical_inputs, _ = _physical_inputs(
+        valid_inputs,
+        cu_seqlens,
+        rank=rank,
+        world_size=world_size,
+        requires_grad=False,
+    )
+
+    first = compile_gdn_headwise_layout(
+        physical_inputs,
+        cu_seqlens=cu_seqlens,
+        group=dist.group.WORLD,
+        cp_size=world_size,
+    )
+    second = compile_gdn_headwise_layout(
+        physical_inputs,
+        cu_seqlens=cu_seqlens,
+        group=dist.group.WORLD,
+        cp_size=world_size,
+    )
+
+    assert first.compact_to_rank_major_index.dtype == torch.int64
+    assert first.compact_to_rank_major_index.device == physical_inputs[0].device
+    assert first.compact_to_rank_major_index.numel() == int(cu_seqlens[-1])
+    assert first.compact_to_rank_major_index.data_ptr() == second.compact_to_rank_major_index.data_ptr()
+    assert first.compact_to_rank_major_index.unique().numel() == int(cu_seqlens[-1])
+
+    prepared, _ = prepare_gdn_headwise_inputs(
+        physical_inputs,
+        group=dist.group.WORLD,
+        layout=first,
+    )
+    restored = restore_gdn_headwise_output(prepared[2], layout=first, group=dist.group.WORLD)
+    transported, _ = prepare_gdn_headwise_inputs(
+        (physical_inputs[0], physical_inputs[1], restored, physical_inputs[3], physical_inputs[4]),
+        group=dist.group.WORLD,
+        layout=first,
+    )
+    torch.testing.assert_close(transported[2], prepared[2], rtol=0, atol=0)
+
+
 def _worker_entry(rank: int, world_size: int, port: int, case_name: str, errors) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -567,6 +612,7 @@ def _worker_entry(rank: int, world_size: int, port: int, case_name: str, errors)
             "all_empty": _run_all_empty_contract,
             "checkpoint": _run_checkpoint_contract,
             "asymmetric_metadata": _run_asymmetric_metadata_contract,
+            "compiled_token_permutation": _run_compiled_token_permutation_contract,
         }
         cases[case_name](rank, world_size)
         errors.put((rank, None))
@@ -638,3 +684,7 @@ def test_headwise_non_reentrant_checkpoint_matches_eager_and_stays_symmetric():
 
 def test_headwise_asymmetric_metadata_fails_on_all_ranks_before_payload_a2a():
     _run_gloo_case("asymmetric_metadata")
+
+
+def test_headwise_compiles_and_reuses_one_inverse_token_permutation():
+    _run_gloo_case("compiled_token_permutation")
