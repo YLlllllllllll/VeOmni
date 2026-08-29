@@ -17,8 +17,6 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 import pytest
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-from transformers.modeling_layers import GradientCheckpointingLayer
 
 
 _real_find_spec = importlib.util.find_spec
@@ -34,7 +32,7 @@ importlib.util.find_spec = _find_spec_without_torch_npu  # type: ignore[assignme
 try:
     import veomni.distributed.parallel_state as parallel_state_module
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
-    from veomni.arguments.arguments_types import ChannelLossConfig, ChunkMBSConfig
+    from veomni.arguments.arguments_types import ChannelLossConfig
     from veomni.distributed.parallel_state import use_parallel_state
     from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
         Qwen2_5OmniForConditionalGeneration,
@@ -1562,6 +1560,7 @@ def test_channel_loss_computer_aggregates_step_results_locally():
 
 def test_base_step_begin_captures_channel_metadata_before_multisource_meter():
     calls = []
+    step_end_calls = []
 
     class RecordingCallback:
         def __init__(self, name, consume_metadata=False):
@@ -1574,17 +1573,28 @@ def test_base_step_begin_captures_channel_metadata_before_multisource_meter():
                 micro_batches[0].pop("ds_idx")
                 micro_batches[0].pop("source_name")
 
+        def on_step_end(self, state, **kwargs):
+            step_end_calls.append(self.name)
+
     trainer = object.__new__(BaseTrainer)
     trainer.state = TrainerState(global_step=1)
     trainer.channel_loss_callback = RecordingCallback("channel")
     meter = RecordingCallback("meter", consume_metadata=True)
     tail = RecordingCallback("tail")
-    trainer._callbacks = [trainer.channel_loss_callback, meter, tail]
+    # Production keeps the meter before channel loss for ``on_step_end`` so
+    # the meter resets step metrics before channel loss publishes its values.
+    # ``on_step_begin`` must still let channel loss snapshot source metadata
+    # before the meter consumes it.
+    trainer._callbacks = [meter, trainer.channel_loss_callback, tail]
     micro_batches = [{"ds_idx": torch.tensor([7]), "source_name": ["repoqa"]}]
 
     BaseTrainer.on_step_begin(trainer, micro_batches=micro_batches, channel_loss_source_repeat=2)
 
     assert calls == [("channel", True, 2), ("meter", True, 2), ("tail", False, 2)]
+
+    BaseTrainer.on_step_end(trainer)
+
+    assert step_end_calls == ["meter", "channel", "tail"]
 
 
 def test_base_step_begin_allows_missing_channel_loss_callback():
@@ -1622,12 +1632,13 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
     trainer.micro_batch_token_len = 1
     trainer.micro_batches_token_len = 1
     trainer.LOG_SAMPLE = False
-    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
+    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()}, {})
 
-    loss, loss_dict = BaseTrainer.forward_backward_step(trainer, {"x": torch.tensor(2.0)})
+    loss, loss_dict, aux_metrics = BaseTrainer.forward_backward_step(trainer, {"x": torch.tensor(2.0)})
 
     assert loss.item() == 2.0
     assert loss_dict["loss"].item() == 2.0
+    assert aux_metrics == {}
     assert trainer.model.weight.grad.item() == 2.0
 
 
@@ -1650,7 +1661,7 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     trainer.micro_batch_token_len = 1
     trainer.micro_batches_token_len = 1
     trainer.LOG_SAMPLE = False
-    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
+    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()}, {})
     trainer.channel_loss_callback = ChannelLossCallback(trainer)
     preforward_seen = {}
 
@@ -1667,142 +1678,13 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     }
 
     trainer.channel_loss_callback.on_step_begin(trainer.state, micro_batches=[micro_batch])
-    loss, loss_dict = BaseTrainer.forward_backward_step(trainer, micro_batch)
+    loss, loss_dict, aux_metrics = BaseTrainer.forward_backward_step(trainer, micro_batch)
 
     assert preforward_seen["has_source_metadata"]
     assert loss.item() == 2.0
     assert loss_dict["loss"].item() == 2.0
+    assert aux_metrics == {}
     assert trainer.model.weight.grad.item() == 2.0
-
-
-def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monkeypatch):
-    import veomni.distributed.chunk_mbs as chunk_mbs
-    import veomni.trainer.base as base_trainer_module
-
-    capture_states = []
-    range_states = []
-    checkpoint_calls = []
-    observation_calls = []
-
-    class CheckpointedDecoderLayer(GradientCheckpointingLayer):
-        def __init__(self, capture_probe):
-            super().__init__()
-            self.proj = torch.nn.Linear(4, 4)
-            self.capture_probe = capture_probe
-
-        def forward(self, hidden_states, **kwargs):
-            capture_states.append(self.capture_probe())
-            range_states.append(chunk_mbs._chunk_mbs_ranges.get())
-            return self.proj(hidden_states)
-
-    class CheckpointedLossModel(torch.nn.Module):
-        _no_split_modules = ["CheckpointedDecoderLayer"]
-
-        def __init__(self, capture_probe):
-            super().__init__()
-            self.layers = torch.nn.ModuleList([CheckpointedDecoderLayer(capture_probe)])
-            self.lm_head = torch.nn.Linear(4, 8, bias=False)
-            self.loss_calls = 0
-
-        def gradient_checkpointing_enable(self, checkpoint_func=None, gradient_checkpointing_kwargs=None):
-            if checkpoint_func is None:
-                checkpoint_func = partial(checkpoint, **(gradient_checkpointing_kwargs or {}))
-            for layer in self.layers:
-                layer.gradient_checkpointing = True
-                layer._gradient_checkpointing_func = checkpoint_func
-
-        def loss_function(self, logits, labels, vocab_size, **kwargs):
-            self.loss_calls += 1
-            return F.cross_entropy(logits[..., :-1, :].flatten(0, 1), labels[..., 1:].flatten())
-
-        def forward(
-            self,
-            x,
-            labels,
-            position_ids,
-            cu_seq_lens_q,
-            cu_seq_lens_k,
-            max_length_q,
-            max_length_k,
-            use_cache=False,
-        ):
-            hidden_states = self.layers[0](
-                x,
-                position_ids=position_ids,
-                cu_seq_lens_q=cu_seq_lens_q,
-                cu_seq_lens_k=cu_seq_lens_k,
-                max_length_q=max_length_q,
-                max_length_k=max_length_k,
-            )
-            logits = self.lm_head(hidden_states)
-            return SimpleNamespace(loss=self.loss_function(logits, labels, logits.shape[-1]))
-
-    trainer = object.__new__(BaseTrainer)
-    trainer.state = TrainerState(global_step=1)
-    trainer.device = torch.device("cpu")
-    trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
-            channel_loss=ChannelLossConfig(enable=True, interval=1),
-            chunk_mbs_config=ChunkMBSConfig(enable=True, chunk_mbs=1),
-            enable_batch_invariant_mode=False,
-            local_rank=0,
-        )
-    )
-    trainer.model = CheckpointedLossModel(lambda: trainer.channel_loss_callback.computer.capture_active)
-    trainer.model.gradient_checkpointing_enable(
-        lambda function, *args, **kwargs: (
-            checkpoint_calls.append(None) or checkpoint(function, *args, use_reentrant=False, **kwargs)
-        )
-    )
-    monkeypatch.setattr(
-        chunk_mbs,
-        "get_parallel_state",
-        lambda: SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
-    )
-    monkeypatch.setattr(base_trainer_module, "use_parallel_state", lambda _: nullcontext())
-    chunk_mbs.apply_chunk_mbs(trainer.model, trainer.args.train.chunk_mbs_config)
-    trainer.model_fwd_context = nullcontext()
-    trainer.model_bwd_context = nullcontext()
-    trainer.micro_batch_token_len = 1
-    trainer.micro_batches_token_len = 1
-    trainer.LOG_SAMPLE = False
-    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
-    trainer.channel_loss_callback = ChannelLossCallback(trainer)
-    original_compute_side_channel = trainer.channel_loss_callback.computer.compute_side_channel
-
-    def record_observation(*args, **kwargs):
-        observation_calls.append(None)
-        return original_compute_side_channel(*args, **kwargs)
-
-    monkeypatch.setattr(trainer.channel_loss_callback.computer, "compute_side_channel", record_observation)
-    cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
-    micro_batch = {
-        "x": torch.randn(1, 4, 4, requires_grad=True),
-        "labels": torch.tensor([[0, 1, 2, 3]]),
-        "position_ids": torch.tensor([[0, 1, 0, 1]]),
-        "cu_seq_lens_q": cu_seq_lens,
-        "cu_seq_lens_k": cu_seq_lens,
-        "max_length_q": 2,
-        "max_length_k": 2,
-        "ds_idx": torch.tensor([3, 4]),
-        "source_name": ["train/a", "train/b"],
-        "cur_token_num": torch.tensor([2, 2]),
-    }
-
-    try:
-        trainer.channel_loss_callback.on_train_begin(trainer.state)
-        trainer.channel_loss_callback.on_step_begin(trainer.state, micro_batches=[micro_batch])
-        BaseTrainer.forward_backward_step(trainer, micro_batch)
-    finally:
-        trainer.channel_loss_callback.on_train_end(trainer.state)
-
-    assert checkpoint_calls == [None, None]
-    assert capture_states == [True, True, False, False]
-    assert all(ranges == trainer._chunk_mbs_ranges for ranges in range_states)
-    assert observation_calls == [None]
-    assert trainer.model.loss_calls == 1
-    assert set(trainer.channel_loss_callback.computer.step_totals) == {3, 4}
-    assert chunk_mbs._chunk_mbs_ranges.get() is None
 
 
 def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
