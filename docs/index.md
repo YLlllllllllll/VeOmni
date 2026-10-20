@@ -30,6 +30,7 @@ usage/basic_modules.md
 usage/qwen38_muon.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
+usage/long_context_dyn_bsz_cold_start.md
 usage/dit_microbatching.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
