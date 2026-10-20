@@ -182,6 +182,49 @@ not rebased for head-specific masks. See
 - Installation: `veomni/ops/install.py` — `apply_ops_patch()` / `apply_veomni_attention_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
+### Qwen4-Exp QSA
+
+`qsa_attention_implementation` accepts `eager` and `tilelang`. `eager` expands
+the compact token selection into the dense reference path; `tilelang` gathers
+selected K/V rows without materializing the quadratic score tensor and requires
+NVIDIA CUDA and BF16 inputs. Neither value dispatches to Ascend.
+
+The standalone `veomni.ops.kernels.qwen4_exp.qsa_attn_npu_fused(query, key,
+value, selected_indices, sm_scale=None, query_chunk_size=2048)` helper is an
+experimental Ascend-only API, **not another value of
+`qsa_attention_implementation`**, and has no automatic CUDA/NPU fallback.
+Callers import it directly on an NPU host with `torch_npu` installed.
+
+Its tensor contract mirrors the compact-index QSA path:
+
+- `query` is `[B, H_q, S, D]`, `key` and `value` are `[B, H_kv, S_kv, D]`,
+  and `selected_indices` is `[B, S, K]`. `H_q` must be divisible by `H_kv`,
+  and no KV heads are expanded in memory. Query, key, and value must be BF16
+  on the same device. Indices are int32/int64 global KV positions, use `-1`
+  for padding or an empty row, and must remain in `[0, S_kv)`. `K` must be
+  nonzero even when every row is empty.
+- The return value is `[B, S, H_q, D]` in sequence-first layout. The native
+  kernels run in BNSD and the wrapper performs the final transpose;
+  `sm_scale` defaults to `D ** -0.5`.
+- Each query block builds one contiguous KV interval, aligns its bounds to 128
+  tokens without excluding a selected token, and constructs an int8 scatter
+  mask for that interval. Attention remains dense inside each interval; this is
+  not a sparse-FLOP kernel. The helper performs no Ulysses/CP communication
+  and adds no checkpoint keys.
+- `query_chunk_size` must be positive and bounds both the query slice and
+  retained softmax statistics. A fragmented selection can still enlarge each
+  block's KV interval. Forward and backward use the same block ranges, but
+  backward rebuilds the interval masks instead of retaining them.
+- Backward is `once_differentiable` and returns gradients for query/key/value
+  only. Indices are non-differentiable metadata. Key/value gradients accumulate
+  in FP32 and are written back in the input dtype. Fully masked query rows have
+  exactly zero output and query gradient; a batch with no valid indices has zero
+  key/value gradients.
+- There is no dropout, additive attention-mask, or KV-cache path. The compact
+  selection defines causality and packed-sample boundaries. Unsupported ranks,
+  dtypes, devices, index ranges, or chunk sizes fail immediately rather than
+  falling back to eager attention.
+
 ### DeepSeek V4 DSA and mHC
 
 DeepSeek V4 exposes three independent model-specific selections. The TileLang
