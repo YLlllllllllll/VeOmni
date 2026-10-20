@@ -200,9 +200,9 @@ Its tensor contract mirrors the compact-index QSA path:
 - `query` is `[B, H_q, S, D]`, `key` and `value` are `[B, H_kv, S_kv, D]`,
   and `selected_indices` is `[B, S, K]`. `H_q` must be divisible by `H_kv`,
   and no KV heads are expanded in memory. Query, key, and value must be BF16
-  on the same device. Indices are int32/int64 global KV positions, use `-1`
-  for padding or an empty row, and must remain in `[0, S_kv)`. `K` must be
-  nonzero even when every row is empty.
+  on the same device. Indices are int32/int64 global KV positions. `-1` is the
+  only permitted padding or empty-row sentinel; every non-sentinel index must
+  remain in `[0, S_kv)`. `K` must be nonzero even when every row is empty.
 - The return value is `[B, S, H_q, D]` in sequence-first layout. The native
   kernels run in BNSD and the wrapper performs the final transpose;
   `sm_scale` defaults to `D ** -0.5`.
