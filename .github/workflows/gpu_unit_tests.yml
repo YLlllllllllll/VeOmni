@@ -206,6 +206,8 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
           uv run --frozen pytest -s -x tests/utils/test_token_accounting.py
+          uv run --frozen pytest -s -x tests/utils/test_profiler_config.py
+          uv run --frozen pytest -s -x tests/utils/test_npu_offline_postprocess.py
           uv run --frozen pytest -s -x tests/tools/test_training_utils.py
           uv run --frozen pytest -s -x tests/utils/test_hdfs_io.py
           uv run --frozen pytest -s -x tests/utils/test_profiler_memory.py
