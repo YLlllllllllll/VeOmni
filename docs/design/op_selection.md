@@ -185,9 +185,10 @@ not rebased for head-specific masks. See
 ### Qwen4-Exp QSA
 
 `qsa_attention_implementation` accepts `eager` and `tilelang`. `eager` expands
-the compact token selection into the dense reference path; `tilelang` gathers
-selected K/V rows without materializing the quadratic score tensor and requires
-NVIDIA CUDA and BF16 inputs. Neither value dispatches to Ascend.
+the compact token selection into the dense reference path and remains available
+on Ascend; `tilelang` gathers selected K/V rows without materializing the
+quadratic score tensor and requires NVIDIA CUDA and BF16 inputs. Neither value
+selects the standalone Ascend fused helper.
 
 The standalone `veomni.ops.kernels.qwen4_exp.qsa_attn_npu_fused(query, key,
 value, selected_indices, sm_scale=None, query_chunk_size=2048)` helper is an
