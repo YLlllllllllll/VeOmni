@@ -119,6 +119,7 @@ seed_omni/mixins/offline_encoding.md
 
 design/optimizer_cpu_offload.md
 design/qwen4_frozen_cpu_ple.md
+design/qwen4_frozen_prefix.md
 design/op_selection.md
 design/fused_moe_ops.md
 design/local_parallel_state.md
