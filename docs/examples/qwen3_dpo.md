@@ -85,6 +85,46 @@ Qwen3-0.6B-dpo-ultrafeedback/
 
 File-by-file contract: [Checkpoint layout](../usage/checkpoint.md).
 
+Each optimizer step uses the global mean over preference pairs, including when
+microbatches or data-parallel ranks contain different numbers of pairs. The
+reported loss and reward metrics use the same pair weights. Sequence-parallel
+ranks must have the same segment boundaries, and all data-parallel ranks must
+execute the same number of microbatches for an optimizer step. For full input
+identity checking across sequence-parallel ranks, enable the experimental
+provenance mode described below. Validate expert and dense gradients separately
+on the target EP/HSDP runtime; their distributed reduction implementations
+can differ. Callback-internal collective failures still rely on the launcher's
+failure handling.
+Without provenance, legacy tail-padding inference can mistake a real final
+one-token segment for padding; use the proven mode or supply unambiguous tail
+metadata before relying on its pair count.
+
+Custom DPO trainers overriding `forward_backward_step` must explicitly declare
+the `pair_normalization` keyword and apply it to the sum of per-pair losses before
+backward. A catch-all `**kwargs` alone is insufficient because it can silently
+discard the scale. An old override without that argument is rejected before model forward;
+using its unweighted microbatch mean would silently change the objective.
+
+For standard DPO packing, the collator now records an exact zero tail when it
+would otherwise be confused with a final one-token segment, and a known nonzero
+collator tail is excluded from loss and gradients. Custom collators must provide
+an exact `tail_padding_length`; if it is missing and the final packed segment is
+one token, the trainer rejects the batch rather than guessing. Enable explicit
+segment provenance below to validate producer segment boundaries and SP sample
+identity in addition to the collator tail. Without it, legacy SP validation
+checks packed layout and tensor shapes but cannot establish that ranks received
+the same sample contents. DPO preflight validates integer token IDs against the
+policy model's configured text vocabulary before running the model.
+
+Checkpoints now record the objective normalization. A trainer-state checkpoint
+from the earlier per-microbatch normalization is rejected by default; use model
+weights only for a clean comparison, or explicitly set
+`dpo_config.allow_legacy_objective_resume: true` to retain the old optimizer and
+scheduler while switching to the corrected normalization. That continuation is
+not numerically equivalent to the old trajectory. A checkpoint without a data
+schema also requires the separate `allow_legacy_data_resume` option and has the
+additional restrictions below.
+
 ## Experimental: explicit segment provenance
 
 Set `dpo_config.explicit_segment_provenance: true` to retain the physical
@@ -123,13 +163,13 @@ mode. Callbacks may remove these fields but may not add or mutate them.
 Local packed tensors and channel-loss metadata are fingerprinted at preflight
 to detect mutation after collation. Model inputs are checked again after
 step-begin callbacks; callbacks should transform data before collation instead.
-Input validation errors after callbacks return are coordinated. Callback
-exceptions and failures inside a callback's own collective rely on the launcher's
-failure handler or timeout, as in the existing trainer.
+Input validation and ordinary rank-local callback exceptions after callbacks
+return are coordinated before model execution. Failures inside a callback's own
+collective still rely on the launcher's failure handler or timeout.
 Use the standard trainer loop: direct `concatenated_forward` calls require a
-microbatch already approved by both rank-agreement phases. This adds two
-WORLD-level object collectives per step; measure their overhead and validate the target
-hardware before using the option for production. CPU/Gloo tests do not establish
+microbatch already approved by both rank-agreement phases. The provenance path
+uses three WORLD-level and one FSDP-group object collective per step; measure
+their overhead and validate the target hardware before using the option for production. CPU/Gloo tests do not establish
 Ascend HCCL behavior, full-model numerical equivalence, or checkpoint recovery.
 
 Resume only with the same data-semantics version and provenance option recorded
@@ -137,8 +177,9 @@ in trainer state. An old or missing trainer state is rejected by default in both
 modes: plaintext prompt-masking semantics changed, so a legacy loader buffer can
 mix old labels with newly transformed labels. Start a fresh run from model weights
 without restoring optimizer, scheduler, or loader state for a consistent objective.
-When provenance is disabled, `dpo_config.allow_legacy_data_resume: true` explicitly
-allows an unversioned legacy checkpoint, but the continuation is not exact and may
+When provenance is disabled, setting both `dpo_config.allow_legacy_data_resume: true`
+and `dpo_config.allow_legacy_objective_resume: true` explicitly allows an
+unversioned legacy checkpoint, but the continuation is not exact and may
 mix buffered labels with new labels and existing optimizer/scheduler state. This
 escape hatch does not permit changing provenance mode or bypass a versioned,
 incompatible protocol; an enabled run cannot use it.

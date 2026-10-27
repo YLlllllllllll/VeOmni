@@ -1051,5 +1051,6 @@ for supported inputs, rank agreement, and checkpoint restrictions.
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
 | explicit_segment_provenance | `bool` | `False` | Experimental packed-segment provenance and rank agreement; validate on the target hardware. |
 | allow_legacy_data_resume | `bool` | `False` | Explicitly permit non-exact legacy DPO data resume only when provenance is disabled. |
+| allow_legacy_objective_resume | `bool` | `False` | Explicitly permit non-exact DPO resume after changing optimizer-step loss normalization. |
 
 The frozen reference always copies `model`. A custom `reference_model` config is not supported.

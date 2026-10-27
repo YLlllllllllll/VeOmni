@@ -851,6 +851,7 @@ def test_step_begin_callback_failure_does_not_update_optimizer(monkeypatch):
         lr_scheduler=MagicMock(),
     )
     trainer.reference_model = SimpleNamespace(parallel_state=state)
+    trainer.post_forward = m.PostCollator()
     with pytest.raises(ValueError, match="injected callback failure"):
         trainer.train_step(iter([[batch]]))
     trainer.policy_model.optimizer.step.assert_not_called()

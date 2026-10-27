@@ -13,19 +13,22 @@
 # limitations under the License.
 
 import copy
+import hashlib
+import inspect
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..arguments import ModelArguments, VeOmniArguments
 from ..data import build_data_transform
-from ..data.data_collator import PostCollator
-from ..data.dpo_collator import DPOProvenanceCollator
+from ..data.data_collator import MainCollator, PostCollator
+from ..data.dpo_collator import DPOProvenanceCollator, DPOZeroTailCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -33,7 +36,7 @@ from ..models.model_runtime import VeOmniModelRuntime
 from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
-from ..utils.device import synchronize
+from ..utils.device import get_device_type, synchronize
 from ..utils.dpo_provenance import (
     DPO_APPROVED_KEY,
     DPO_CALLBACK_METADATA_KEYS,
@@ -99,6 +102,250 @@ def _build_dpo_labels_list(
     return labels_list
 
 
+@dataclass(frozen=True)
+class _DPOPairWeighting:
+    """Pair counts include the duplicated loss on each sequence-parallel rank."""
+
+    local_counts: tuple[int, ...]
+    global_count: int
+    group_size: int
+    group: Any
+
+    @property
+    def backward_scale(self) -> float:
+        return self.group_size / self.global_count
+
+
+def _dpo_pair_weighting(
+    micro_batches: list[dict[str, Any]] | None,
+    post_forward: PostCollator,
+    state: Any,
+    provenance_enabled: bool,
+    *,
+    loader_error: Exception | None = None,
+    backward_hook: Any = None,
+    vocab_size: Any = None,
+) -> _DPOPairWeighting:
+    """Agree on pair counts before backward enters any model collective."""
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    group = getattr(state, "fsdp_group", None) if distributed else None
+    group_size = dist.get_world_size(group) if distributed else 1
+    packet: dict[str, Any] = {"rank": rank, "status": "ok", "error": None}
+    local_counts: list[int] = []
+    layouts: list[Any] = []
+    try:
+        if loader_error is not None:
+            raise loader_error
+        if backward_hook is not None:
+            try:
+                signature = inspect.signature(backward_hook)
+                parameter = signature.parameters.get("pair_normalization")
+                if parameter is None or parameter.kind not in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                ):
+                    raise ValueError("missing explicit pair_normalization parameter")
+                signature.bind({}, pair_normalization=1.0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "DPO forward_backward_step overrides must accept pair_normalization and apply it to the pair-loss sum"
+                ) from exc
+        if not isinstance(micro_batches, list) or not micro_batches:
+            raise ValueError("DPO optimizer step requires a nonempty list of microbatches")
+        vocabulary = vocab_size() if vocab_size is not None else None
+        if vocabulary is not None and (type(vocabulary) is not int or vocabulary <= 0):
+            raise ValueError("DPO model vocabulary size must be a positive integer")
+        for batch in micro_batches:
+            if not isinstance(batch, dict):
+                raise ValueError("DPO microbatch must be a dictionary")
+            input_ids, labels, cu_q = batch.get("input_ids"), batch.get("labels"), batch.get("cu_seq_lens_q")
+            if (
+                not isinstance(input_ids, torch.Tensor)
+                or not isinstance(labels, torch.Tensor)
+                or input_ids.ndim != 2
+                or input_ids.shape[0] != 1
+                or input_ids.numel() == 0
+                or labels.shape != input_ids.shape
+            ):
+                raise ValueError("DPO packed input_ids and labels must have the same nonempty [1, local_tokens] shape")
+            if input_ids.dtype not in (torch.int32, torch.int64) or labels.dtype not in (torch.int32, torch.int64):
+                raise ValueError("DPO input_ids and labels must use integer token IDs")
+            if not bool((input_ids >= 0).all()) or not bool(((labels >= 0) | (labels == IGNORE_INDEX)).all()):
+                raise ValueError("DPO input or label contains an invalid negative token ID")
+            if vocabulary is not None and (
+                not bool((input_ids < vocabulary).all())
+                or not bool(((labels < vocabulary) | (labels == IGNORE_INDEX)).all())
+            ):
+                raise ValueError("DPO input or label token ID is outside the model vocabulary")
+            if (
+                not isinstance(cu_q, torch.Tensor)
+                or cu_q.ndim != 1
+                or cu_q.dtype not in (torch.int16, torch.int32, torch.int64)
+                or cu_q.numel() < 2
+            ):
+                raise ValueError("DPO cu_seq_lens_q must be a one-dimensional integer boundary tensor")
+            boundaries = cu_q.tolist()
+            global_tokens = input_ids.numel() * (state.sp_size if getattr(state, "sp_enabled", False) else 1)
+            if (
+                boundaries[0] != 0
+                or boundaries[-1] != global_tokens
+                or any(right <= left for left, right in zip(boundaries, boundaries[1:]))
+            ):
+                raise ValueError("DPO packed boundaries must be increasing and cover all global input tokens")
+            tail = batch.get("tail_padding_length")
+            if tail is not None:
+                if isinstance(tail, torch.Tensor):
+                    if tail.ndim != 0 or tail.dtype not in (torch.int16, torch.int32, torch.int64):
+                        raise ValueError("DPO tail padding length must be a scalar integer")
+                    tail = int(tail)
+                if (
+                    type(tail) is not int
+                    or tail < 0
+                    or tail >= global_tokens
+                    or global_tokens - tail not in boundaries
+                ):
+                    raise ValueError("DPO tail padding length must mark a valid packed boundary")
+            cu_k = batch.get("cu_seq_lens_k")
+            if cu_k is not None and (
+                not isinstance(cu_k, torch.Tensor)
+                or cu_k.ndim != 1
+                or cu_k.dtype not in (torch.int16, torch.int32, torch.int64)
+                or cu_k.tolist() != boundaries
+            ):
+                raise ValueError("DPO self-attention query and key boundaries must match")
+            linear_cu = batch.get("linear_attn_cu_seq_lens_q")
+            if linear_cu is not None and (
+                not isinstance(linear_cu, torch.Tensor)
+                or linear_cu.ndim != 1
+                or linear_cu.dtype not in (torch.int16, torch.int32, torch.int64)
+                or linear_cu.tolist() != boundaries
+            ):
+                raise ValueError("DPO linear-attention and query boundaries must match")
+            maximum = max(right - left for left, right in zip(boundaries, boundaries[1:]))
+            for key in ("max_length_q", "max_length_k"):
+                value = batch.get(key)
+                if isinstance(value, torch.Tensor) and value.ndim == 0:
+                    value = int(value)
+                if value is not None and (type(value) is not int or value != maximum):
+                    raise ValueError(f"DPO {key} disagrees with the packed boundaries")
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None and (
+                not isinstance(attention_mask, torch.Tensor) or tuple(attention_mask.shape) != (1, global_tokens)
+            ):
+                raise ValueError("DPO attention mask must cover the global packed tokens")
+            if provenance_enabled:
+                proof = batch.get(DPO_APPROVED_KEY)
+                if not isinstance(proof, DPOPackedProof):
+                    raise ValueError("DPO pair counting requires post-callback segment provenance")
+                lengths = proof.segment_lengths
+            else:
+                if tail is None and boundaries[-1] - boundaries[-2] == 1:
+                    raise ValueError(
+                        "DPO trailing one-token segments are ambiguous without tail padding metadata; "
+                        "enable explicit_segment_provenance or supply the exact tail_padding_length"
+                    )
+                lengths = post_forward.compute_seqlens_func(batch)
+            if not lengths or len(lengths) % 2 or any(type(length) is not int or length <= 0 for length in lengths):
+                raise ValueError("DPO microbatch must contain nonempty chosen/rejected segment pairs")
+            local_counts.append(len(lengths) // 2)
+            layouts.append(
+                (
+                    tuple(lengths),
+                    tuple(boundaries),
+                    tail,
+                    tuple(input_ids.shape),
+                    cu_k is not None,
+                    linear_cu is not None,
+                    attention_mask is not None,
+                    batch.get("max_length_q") is not None,
+                    batch.get("max_length_k") is not None,
+                )
+            )
+        layout_digest = hashlib.sha256(repr(tuple(layouts)).encode()).hexdigest()
+        if getattr(state, "sp_enabled", False):
+            if not distributed or getattr(state, "sp_group", None) is None:
+                raise ValueError("DPO sequence parallelism requires an initialized process group")
+            members = tuple(dist.get_process_group_ranks(state.sp_group))
+            if (
+                len(members) != state.sp_size
+                or not 0 <= state.sp_rank < len(members)
+                or members[state.sp_rank] != rank
+            ):
+                raise ValueError("DPO sequence-parallel group metadata is inconsistent")
+        else:
+            members = (rank,)
+        packet.update(
+            {
+                "microsteps": len(local_counts),
+                "pair_count": sum(local_counts),
+                "sp_members": members,
+                "layout_digest": layout_digest,
+            }
+        )
+    except StopIteration:
+        packet["status"] = "eof"
+    except Exception as exc:  # noqa: BLE001 - every rank must agree before forward
+        packet["status"] = "error"
+        packet["error"] = f"{type(exc).__name__}: {exc}"[:512]
+    if distributed:
+        packets: list[dict[str, Any]] = [None] * group_size
+        dist.all_gather_object(packets, packet, group=group)
+    else:
+        packets = [packet]
+    statuses = {item["status"] for item in packets}
+    if statuses == {"eof"}:
+        raise StopIteration
+    failures = [item for item in packets if item["status"] == "error"]
+    if failures:
+        raise RuntimeError(f"DPO pair-count preflight failed on rank {failures[0]['rank']}: {failures[0]['error']}")
+    if "eof" in statuses:
+        raise RuntimeError("DPO ranks reached the end of the data at different times")
+    if len({item["microsteps"] for item in packets}) != 1:
+        raise RuntimeError("DPO ranks must execute the same number of microbatches per optimizer step")
+    groups: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    for item in packets:
+        groups.setdefault(item["sp_members"], []).append(item)
+    for members, peers in groups.items():
+        if {item["rank"] for item in peers} != set(members) or len({item["layout_digest"] for item in peers}) != 1:
+            raise RuntimeError("DPO sequence-parallel ranks disagree on per-microbatch segment boundaries")
+    global_count = sum(item["pair_count"] for item in packets)
+    if global_count <= 0:
+        raise RuntimeError("DPO optimizer step contains no preference pairs")
+    return _DPOPairWeighting(tuple(local_counts), global_count, group_size, group)
+
+
+def _dpo_sync_step_begin_error(error: Exception | None) -> None:
+    """Prevent a local pre-forward callback failure stranding peers at the next collective."""
+    if not dist.is_available() or not dist.is_initialized():
+        if error is not None:
+            raise error
+        return
+    packet = None if error is None else f"rank {dist.get_rank()}: {type(error).__name__}: {error}"
+    packets = [None] * dist.get_world_size()
+    dist.all_gather_object(packets, packet)
+    failures = [failure for failure in packets if failure is not None]
+    if failures:
+        raise RuntimeError("DPO step-begin callback failed: " + "; ".join(failures)) from error
+
+
+def _reduce_dpo_pair_metrics(
+    loss_sum: float, metric_sums: dict[str, float], weighting: _DPOPairWeighting
+) -> tuple[float, dict[str, float]]:
+    """Return the same global pair-weighted metrics on every FSDP rank."""
+    names = sorted(metric_sums)
+    values = [loss_sum, *(metric_sums[name] for name in names)]
+    if dist.is_available() and dist.is_initialized():
+        backend = str(dist.get_backend(weighting.group)).lower()
+        device = "cpu" if backend == "gloo" else get_device_type()
+        result = torch.tensor(values, dtype=torch.float32, device=device)
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=weighting.group)
+        values = result.cpu().tolist()
+    return values[0] / weighting.global_count, {
+        name: value / weighting.global_count for name, value in zip(names, values[1:])
+    }
+
+
 # ================================ DPO Arguments ======================================
 
 
@@ -137,6 +384,10 @@ class DPOConfig:
     allow_legacy_data_resume: bool = field(
         default=False,
         metadata={"help": "Allow non-exact resume from unversioned DPO data when provenance is disabled."},
+    )
+    allow_legacy_objective_resume: bool = field(
+        default=False,
+        metadata={"help": "Allow a non-exact DPO resume after changing the optimizer-step normalization."},
     )
 
 
@@ -237,6 +488,8 @@ class TextDPOTrainer:
                 self.base.collate_fn = DPOProvenanceCollator(
                     self.base.collate_fn, require_ds_idx=args.data.enable_multisource
                 )
+            elif type(self.base.collate_fn) is MainCollator:
+                self.base.collate_fn = DPOZeroTailCollator(self.base.collate_fn)
             self.base._build_dataloader()
         self._build_postforward()
         self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
@@ -288,37 +541,64 @@ class TextDPOTrainer:
         text_config = get_text_config() if callable(get_text_config) else getattr(config, "text_config", config)
         vocab_size = getattr(text_config, "vocab_size", None)
         if type(vocab_size) is not int or vocab_size <= 0:
-            raise ValueError("DPO provenance requires a valid model vocabulary size")
+            raise ValueError("DPO requires a valid model vocabulary size")
         return vocab_size
 
     def dpo_provenance_checkpoint_state(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 3,
             "enabled": self.base.args.dpo_config.explicit_segment_provenance,
             "plaintext_transform_version": 1,
+            "objective_normalization": "global_pair_mean_v1",
         }
 
     def validate_dpo_provenance_checkpoint(self, saved: Any) -> None:
         current = self.dpo_provenance_checkpoint_state()
         if saved is None:
-            if not current["enabled"] and self.base.args.dpo_config.allow_legacy_data_resume:
+            if (
+                not current["enabled"]
+                and self.base.args.dpo_config.allow_legacy_data_resume
+                and self.base.args.dpo_config.allow_legacy_objective_resume
+            ):
                 logger.warning_rank0(
-                    "Allowing non-exact legacy DPO resume: buffered labels, new plaintext labels, optimizer, "
-                    "and scheduler state may not correspond to the same data semantics."
+                    "Allowing non-exact legacy DPO resume: old data, optimizer and scheduler state may use "
+                    "different data semantics and loss normalization."
                 )
                 return
             raise ValueError(
                 "legacy DPO trainer state has no data-semantics version; start from weights only, "
-                "or explicitly enable allow_legacy_data_resume with provenance disabled"
+                "or explicitly enable allow_legacy_data_resume and allow_legacy_objective_resume with provenance disabled"
             )
         if (
+            type(saved) is dict
+            and set(saved) == {"version", "enabled", "plaintext_transform_version"}
+            and type(saved["version"]) is int
+            and saved["version"] == 2
+            and type(saved["enabled"]) is bool
+            and type(saved["plaintext_transform_version"]) is int
+            and saved["plaintext_transform_version"] == 1
+        ):
+            if saved["enabled"] != current["enabled"]:
+                raise ValueError("DPO provenance mode must match the saved trainer state")
+            if not self.base.args.dpo_config.allow_legacy_objective_resume:
+                raise ValueError(
+                    "DPO checkpoint used legacy microbatch loss normalization; start from weights only or explicitly "
+                    "enable allow_legacy_objective_resume for a non-exact continuation"
+                )
+            logger.warning_rank0(
+                "Resuming legacy DPO optimizer state with global pair-mean normalization; "
+                "this is not equivalent to uninterrupted legacy training."
+            )
+            return
+        if (
             type(saved) is not dict
-            or set(saved) != {"version", "enabled", "plaintext_transform_version"}
+            or set(saved) != {"version", "enabled", "plaintext_transform_version", "objective_normalization"}
             or type(saved["version"]) is not int
-            or saved["version"] != 2
+            or saved["version"] != 3
             or type(saved["enabled"]) is not bool
             or type(saved["plaintext_transform_version"]) is not int
             or saved["plaintext_transform_version"] != 1
+            or saved["objective_normalization"] != "global_pair_mean_v1"
         ):
             raise ValueError("Unsupported DPO data-semantics checkpoint protocol")
         if current != saved:
@@ -449,14 +729,16 @@ class TextDPOTrainer:
             sp_group = get_parallel_state().sp_group
             log_probs_packed = gather_outputs(log_probs_packed, gather_dim=0, group=sp_group)
             log_probs_packed = log_probs_packed[: sum(seq_lens)]
-        elif isinstance(approved, DPOPackedProof):
+        elif isinstance(approved, DPOPackedProof) or micro_batch.get("tail_padding_length") is not None:
             valid_length = sum(seq_lens)
             labels = micro_batch["labels"].reshape(-1)
-            if (
-                log_probs_packed.numel() != valid_length + approved.collator_tail
-                or labels.numel() != log_probs_packed.numel()
-            ):
-                raise ValueError("DPO proof disagrees with model log-probs or collator padding")
+            tail = (
+                approved.collator_tail
+                if isinstance(approved, DPOPackedProof)
+                else int(micro_batch["tail_padding_length"])
+            )
+            if log_probs_packed.numel() != valid_length + tail or labels.numel() != log_probs_packed.numel():
+                raise ValueError("DPO segments disagree with model log-probs or collator padding")
             log_probs_packed = log_probs_packed[:valid_length]
         log_probs_list = list(log_probs_packed.split(seq_lens, dim=0))
 
@@ -486,7 +768,7 @@ class TextDPOTrainer:
         return all_logps_t[0::2], all_logps_t[1::2]
 
     def forward_backward_step(
-        self, micro_batch: Dict[str, torch.Tensor]
+        self, micro_batch: Dict[str, torch.Tensor], *, pair_normalization: float | None = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         channel_loss_callback = BaseTrainer._get_registered_channel_loss_callback(self.base)
         micro_step_context = (
@@ -543,7 +825,8 @@ class TextDPOTrainer:
                 self.base.model_bwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
             ):
-                loss.backward()
+                backward_loss = loss if pair_normalization is None else losses.sum() * pair_normalization
+                backward_loss.backward()
 
             del micro_batch
             return loss, loss_dict
@@ -551,6 +834,7 @@ class TextDPOTrainer:
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         self.state.global_step += 1
 
+        loader_error = None
         if self.base.args.dpo_config.explicit_segment_provenance:
             micro_batches = next_dpo_microbatches(
                 data_iterator,
@@ -566,15 +850,33 @@ class TextDPOTrainer:
                 vocab_size=self._dpo_vocabulary_size,
             )
         else:
-            micro_batches: List[Dict[str, Any]] = next(data_iterator)
+            try:
+                micro_batches: List[Dict[str, Any]] = next(data_iterator)
+            except Exception as exc:  # noqa: BLE001 - synchronize before callbacks/model collectives
+                micro_batches, loader_error = None, exc
+
+        weighting = _dpo_pair_weighting(
+            micro_batches,
+            self.post_forward,
+            self.policy_model.parallel_state,
+            self.base.args.dpo_config.explicit_segment_provenance,
+            loader_error=loader_error,
+            backward_hook=self.forward_backward_step,
+            vocab_size=self._dpo_vocabulary_size,
+        )
 
         expected_proofs = (
             tuple(batch[DPO_APPROVED_KEY] for batch in micro_batches)
             if self.base.args.dpo_config.explicit_segment_provenance
             else None
         )
-        self.base._reset_async_activation_offload_if_enabled(self.policy_model)
-        self.on_step_begin(micro_batches=micro_batches)
+        step_begin_error = None
+        try:
+            self.base._reset_async_activation_offload_if_enabled(self.policy_model)
+            self.on_step_begin(micro_batches=micro_batches)
+        except Exception as exc:  # noqa: BLE001 - report a local callback error to every rank before forwarding
+            step_begin_error = exc
+        _dpo_sync_step_begin_error(step_begin_error)
         if self.base.args.dpo_config.explicit_segment_provenance:
             next_dpo_microbatches(
                 iter([micro_batches]),
@@ -585,38 +887,37 @@ class TextDPOTrainer:
                 after_callbacks=True,
                 expected_proofs=expected_proofs,
             )
-
+        else:
+            weighting = _dpo_pair_weighting(
+                micro_batches,
+                self.post_forward,
+                self.policy_model.parallel_state,
+                False,
+                vocab_size=self._dpo_vocabulary_size,
+            )
         self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict: Dict[str, float] = defaultdict(float)
 
         num_micro_steps = len(micro_batches)
-        for micro_step, micro_batch in enumerate(micro_batches):
+        for micro_step, (micro_batch, pair_count) in enumerate(zip(micro_batches, weighting.local_counts)):
             mark_compile_step_begin(getattr(self.policy_model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps, self.policy_model)
             self.base._configure_hsdp_allreduce(micro_step, num_micro_steps, self.policy_model)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            loss, loss_dict = self.forward_backward_step(micro_batch, pair_normalization=weighting.backward_scale)
 
-            total_loss += loss.item()
+            total_loss += loss.item() * pair_count
             for k, v in loss_dict.items():
-                total_loss_dict[k] += v.item()
+                total_loss_dict[k] += v.item() * pair_count
+
+        total_loss, total_loss_dict = _reduce_dpo_pair_metrics(total_loss, total_loss_dict, weighting)
 
         grad_norm = self.policy_model.clip_grad_norm()
 
         self.policy_model.optimizer.step()
         self.policy_model.lr_scheduler.step()
         self.policy_model.optimizer.zero_grad()
-
-        # The other trainers may report the sum of their micro batches' losses
-        # because ``mean_global_loss`` has already scaled each one by its share of
-        # the step's tokens, so the sum is the step's mean. Nothing above carries
-        # that weight: ``forward_backward_step`` builds ``loss_dict`` out of plain
-        # per-micro-batch means, so the sums are averaged here instead. Reporting
-        # them raw scaled every value by ``gradient_accumulation_steps`` -- most
-        # visibly ``reward_accuracy``, a fraction of pairs that read above 1.
-        total_loss /= num_micro_steps
-        total_loss_dict = {key: value / num_micro_steps for key, value in total_loss_dict.items()}
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 

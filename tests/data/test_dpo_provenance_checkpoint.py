@@ -27,9 +27,13 @@ from veomni.utils.dpo_provenance import DPO_FEATURE_KEY, DPOFeatureSegments
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _trainer(enabled, allow_legacy=False):
+def _trainer(enabled, allow_legacy=False, allow_legacy_objective=False):
     trainer = TextDPOTrainer.__new__(TextDPOTrainer)
-    config = SimpleNamespace(explicit_segment_provenance=enabled, allow_legacy_data_resume=allow_legacy)
+    config = SimpleNamespace(
+        explicit_segment_provenance=enabled,
+        allow_legacy_data_resume=allow_legacy,
+        allow_legacy_objective_resume=allow_legacy_objective,
+    )
     checkpoint = SimpleNamespace(load_path="/unused")
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(dpo_config=config, train=SimpleNamespace(checkpoint=checkpoint, global_rank=0)),
@@ -39,21 +43,54 @@ def _trainer(enabled, allow_legacy=False):
 
 
 @pytest.mark.parametrize(
-    "current,saved,allow_legacy,raises",
+    "current,saved,allow_legacy,allow_legacy_objective,raises",
     [
-        (False, None, False, True),
-        (False, None, True, False),
-        (True, None, True, True),
-        (True, {"version": 2, "enabled": True, "plaintext_transform_version": 1}, False, False),
-        (False, {"version": 2, "enabled": False, "plaintext_transform_version": 1}, False, False),
-        (False, {"version": 2, "enabled": True, "plaintext_transform_version": 1}, True, True),
-        (True, {"version": 1, "enabled": True}, True, True),
-        (True, {"version": 2, "enabled": 1, "plaintext_transform_version": 1}, True, True),
-        (True, {"version": 2, "enabled": True, "plaintext_transform_version": 2}, True, True),
+        (False, None, False, False, True),
+        (False, None, True, False, True),
+        (False, None, True, True, False),
+        (True, None, True, True, True),
+        (True, {"version": 2, "enabled": True, "plaintext_transform_version": 1}, False, False, True),
+        (True, {"version": 2, "enabled": True, "plaintext_transform_version": 1}, False, True, False),
+        (False, {"version": 2, "enabled": False, "plaintext_transform_version": 1}, False, True, False),
+        (False, {"version": 2, "enabled": True, "plaintext_transform_version": 1}, True, True, True),
+        (True, {"version": 1, "enabled": True}, True, True, True),
+        (True, {"version": 2, "enabled": 1, "plaintext_transform_version": 1}, True, True, True),
+        (True, {"version": 2, "enabled": True, "plaintext_transform_version": 2}, True, True, True),
+        (
+            True,
+            {
+                "version": 3,
+                "enabled": True,
+                "plaintext_transform_version": 1,
+                "objective_normalization": "global_pair_mean_v1",
+            },
+            False,
+            False,
+            False,
+        ),
+        (
+            False,
+            {
+                "version": 3,
+                "enabled": False,
+                "plaintext_transform_version": 1,
+                "objective_normalization": "global_pair_mean_v1",
+            },
+            False,
+            False,
+            False,
+        ),
+        (
+            True,
+            {"version": 3, "enabled": True, "plaintext_transform_version": 1, "objective_normalization": "unknown"},
+            True,
+            True,
+            True,
+        ),
     ],
 )
-def test_checkpoint_mode_contract(current, saved, allow_legacy, raises):
-    trainer = _trainer(current, allow_legacy)
+def test_checkpoint_mode_contract(current, saved, allow_legacy, allow_legacy_objective, raises):
+    trainer = _trainer(current, allow_legacy, allow_legacy_objective)
     if raises:
         with pytest.raises(ValueError):
             trainer.validate_dpo_provenance_checkpoint(saved)
@@ -86,7 +123,7 @@ def test_missing_checkpoint_trainer_state_does_not_assume_safe_mode(monkeypatch,
 
 
 def test_explicit_legacy_resume_keeps_old_missing_state_fallback(monkeypatch):
-    trainer = _trainer(False, allow_legacy=True)
+    trainer = _trainer(False, allow_legacy=True, allow_legacy_objective=True)
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
     callback._read_current = lambda _: None
