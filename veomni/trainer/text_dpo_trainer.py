@@ -15,10 +15,11 @@
 import copy
 import hashlib
 import inspect
+import math
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -27,8 +28,9 @@ import torch.nn.functional as F
 
 from ..arguments import ModelArguments, VeOmniArguments
 from ..data import build_data_transform
-from ..data.data_collator import MainCollator, PostCollator
-from ..data.dpo_collator import DPOProvenanceCollator, DPOZeroTailCollator
+from ..data.data_collator import PostCollator
+from ..data.data_transform import dpo_producer_identity
+from ..data.dpo_collator import DPOProvenanceCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -159,6 +161,8 @@ def _dpo_pair_weighting(
         for batch in micro_batches:
             if not isinstance(batch, dict):
                 raise ValueError("DPO microbatch must be a dictionary")
+            if batch.get("padding_flag", False) is not False:
+                raise ValueError("DPO does not support duplicated padding microbatches in pair-mean training")
             input_ids, labels, cu_q = batch.get("input_ids"), batch.get("labels"), batch.get("cu_seq_lens_q")
             if (
                 not isinstance(input_ids, torch.Tensor)
@@ -315,7 +319,7 @@ def _dpo_pair_weighting(
     return _DPOPairWeighting(tuple(local_counts), global_count, group_size, group)
 
 
-def _dpo_sync_step_begin_error(error: Exception | None) -> None:
+def _dpo_sync_step_begin_error(error: Exception | None, *, context: str = "step-begin callback") -> None:
     """Prevent a local pre-forward callback failure stranding peers at the next collective."""
     if not dist.is_available() or not dist.is_initialized():
         if error is not None:
@@ -326,7 +330,137 @@ def _dpo_sync_step_begin_error(error: Exception | None) -> None:
     dist.all_gather_object(packets, packet)
     failures = [failure for failure in packets if failure is not None]
     if failures:
-        raise RuntimeError("DPO step-begin callback failed: " + "; ".join(failures)) from error
+        raise RuntimeError(f"DPO {context} failed: " + "; ".join(failures)) from error
+
+
+def _dpo_check_consistent_across_ranks(value: Any, *, context: str) -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    values = [None] * dist.get_world_size()
+    dist.all_gather_object(values, value)
+    if any(item != values[0] for item in values):
+        raise RuntimeError(f"DPO {context} does not match across ranks")
+
+
+def _dpo_recovery_geometry(args: Any) -> dict[str, Any]:
+    train, data, accelerator = args.train, args.data, args.model.accelerator
+    loader = data.dataloader
+    if loader.num_workers > 0 and loader.in_order is not True:
+        raise ValueError("DPO exact recovery requires in-order multi-worker data loading")
+    if train.dyn_bsz and train.dyn_bsz_runtime != "main":
+        raise ValueError("DPO exact recovery requires main-process dynamic batching")
+    if train.dyn_bsz and loader.use_background_prefetcher and not loader.drop_last:
+        raise ValueError("DPO exact recovery cannot combine background prefetch with dynamic flush padding")
+    fields = {
+        "train": (
+            train,
+            (
+                "world_size",
+                "micro_batch_size",
+                "global_batch_size",
+                "gradient_accumulation_steps",
+                "dataloader_batch_size",
+                "dyn_bsz",
+                "dyn_bsz_runtime",
+                "dyn_bsz_count_mode",
+                "dyn_bsz_physical_overflow_ratio",
+                "pad_to_length",
+                "bsz_warmup_ratio",
+                "bsz_warmup_init_mbtoken",
+                "seed",
+                "num_train_epochs",
+                "max_steps",
+            ),
+        ),
+        "data": (
+            data,
+            (
+                "train_path",
+                "train_size",
+                "train_sample",
+                "dyn_bsz_buffer_size",
+                "max_seq_len",
+                "data_type",
+                "datasets_type",
+                "dataset_repeat",
+                "multisource_datasets_type",
+                "dataset_name",
+                "enable_multisource",
+                "text_keys",
+                "silent_exception",
+            ),
+        ),
+        "loader": (
+            loader,
+            (
+                "num_workers",
+                "type",
+                "worker_num_threads",
+                "prefetch_factor",
+                "persistent_workers",
+                "in_order",
+                "drop_last",
+                "shuffle",
+                "pin_memory",
+                "use_background_prefetcher",
+            ),
+        ),
+        "parallel": (
+            accelerator,
+            (
+                "dp_size",
+                "dp_replicate_size",
+                "dp_shard_size",
+                "ep_size",
+                "ep_outside",
+                "extra_parallel_sizes",
+                "extra_parallel_names",
+                "extra_parallel_placement_innermost",
+                "tp_size",
+                "pp_size",
+                "ulysses_size",
+                "cp_size",
+            ),
+        ),
+    }
+    return {name: {key: copy.deepcopy(getattr(obj, key)) for key in keys} for name, (obj, keys) in fields.items()}
+
+
+def _dpo_objective_parameters(config: Any) -> dict[str, Any]:
+    result = {
+        name: getattr(config, name)
+        for name in (
+            "beta",
+            "label_smoothing",
+            "reference_free",
+            "loss_type",
+            "average_log_prob",
+            "refer_model_precision",
+        )
+    }
+    result["audited_unpadded_tokenizer_sha256"] = getattr(config, "audited_unpadded_tokenizer_sha256", None)
+    for name in ("beta", "label_smoothing"):
+        if type(result[name]) not in (int, float) or not math.isfinite(result[name]):
+            raise ValueError(f"DPO {name} must be a finite number")
+    if result["beta"] <= 0 or not 0 <= result["label_smoothing"] <= 1:
+        raise ValueError("DPO beta must be positive and label_smoothing must be between 0 and 1")
+    for name in ("reference_free", "average_log_prob"):
+        if type(result[name]) is not bool:
+            raise ValueError(f"DPO {name} must be a boolean")
+    if result["loss_type"] not in ("sigmoid", "ipo"):
+        raise ValueError("DPO loss_type must be 'sigmoid' or 'ipo'")
+    if result["loss_type"] == "ipo" and result["label_smoothing"] != 0:
+        raise ValueError("DPO label_smoothing is unsupported for IPO")
+    if result["refer_model_precision"] not in ("float32", "bfloat16"):
+        raise ValueError("DPO refer_model_precision must be 'float32' or 'bfloat16'")
+    fingerprint = result["audited_unpadded_tokenizer_sha256"]
+    if fingerprint is not None and (
+        type(fingerprint) is not str
+        or len(fingerprint) != 64
+        or any(ch not in "0123456789abcdef" for ch in fingerprint)
+    ):
+        raise ValueError("DPO audited_unpadded_tokenizer_sha256 must be a lowercase SHA-256 digest")
+    return result
 
 
 def _reduce_dpo_pair_metrics(
@@ -378,16 +512,20 @@ class DPOConfig:
         metadata={"help": "Precision of the reference model."},
     )
     explicit_segment_provenance: bool = field(
-        default=False,
-        metadata={"help": "Experimental DPO packed-segment proof and rank agreement; requires native validation."},
+        default=True,
+        metadata={"help": "DPO packed-segment proof and rank agreement; required for pair-weighted training."},
     )
     allow_legacy_data_resume: bool = field(
         default=False,
-        metadata={"help": "Allow non-exact resume from unversioned DPO data when provenance is disabled."},
+        metadata={"help": "Legacy compatibility field; required provenance cannot be bypassed."},
     )
     allow_legacy_objective_resume: bool = field(
         default=False,
-        metadata={"help": "Allow a non-exact DPO resume after changing the optimizer-step normalization."},
+        metadata={"help": "Legacy compatibility field; it cannot bypass the producer-contract checkpoint gate."},
+    )
+    audited_unpadded_tokenizer_sha256: Optional[str] = field(
+        default=None,
+        metadata={"help": "Fingerprint of a fast tokenizer explicitly audited to emit unpadded DPO sequences."},
     )
 
 
@@ -474,10 +612,28 @@ class TextDPOTrainer:
     reference_model: DPOReferenceModelRuntime
 
     def __init__(self, args: VeOmniDPOArguments):
+        self._dpo_provenance_required = True
+        self._dpo_epoch_step = 0
+        self._dpo_epoch_complete = False
+        self._dpo_pending_epoch_end = None
+        self._dpo_pending_loader_state = None
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        config_error = None
+        try:
+            if args.dpo_config.explicit_segment_provenance is not True:
+                raise ValueError("DPO pair-weighted training requires explicit_segment_provenance=true")
+            if args.model.accelerator.tp_size != 1 or args.model.accelerator.pp_size != 1:
+                raise ValueError("DPO pair-weighted training currently requires tp_size=pp_size=1")
+            self._dpo_objective_parameters = _dpo_objective_parameters(args.dpo_config)
+            self._dpo_recovery_geometry = _dpo_recovery_geometry(args)
+        except Exception as exc:  # noqa: BLE001 - synchronize malformed rank-local configuration
+            config_error = exc
+        _dpo_sync_step_begin_error(config_error, context="configuration")
+        _dpo_check_consistent_across_ranks(self._dpo_objective_parameters, context="objective parameters")
+        _dpo_check_consistent_across_ranks(self._dpo_recovery_geometry, context="recovery geometry")
         self.policy_model = self._build_policy_model_runtime()
 
         with use_parallel_state(self.policy_model.parallel_state):
@@ -488,9 +644,11 @@ class TextDPOTrainer:
                 self.base.collate_fn = DPOProvenanceCollator(
                     self.base.collate_fn, require_ds_idx=args.data.enable_multisource
                 )
-            elif type(self.base.collate_fn) is MainCollator:
-                self.base.collate_fn = DPOZeroTailCollator(self.base.collate_fn)
             self.base._build_dataloader()
+            from ..data.dynamic_batching import DynamicBatchSizeDataLoader
+
+            if isinstance(self.base.train_dataloader, DynamicBatchSizeDataLoader):
+                self.base.train_dataloader._dpo_disallow_implicit_restart = True
         self._build_postforward()
         self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
         self.base._build_training_context(self.policy_model)
@@ -523,7 +681,22 @@ class TextDPOTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDPOArguments = self.base.args
+        self._dpo_transform_max_seq_len = args.data.max_seq_len
         provenance_options = {"record_segment_provenance": True} if args.dpo_config.explicit_segment_provenance else {}
+        tokenizer_fingerprint = getattr(args.dpo_config, "audited_unpadded_tokenizer_sha256", None)
+        if getattr(self, "_dpo_provenance_required", False):
+            identity_error = None
+            try:
+                self._dpo_producer_identity = dpo_producer_identity(
+                    self.policy_model.tokenizer, self.policy_model.chat_template, tokenizer_fingerprint
+                )
+            except Exception as exc:  # noqa: BLE001 - report producer failures consistently across ranks
+                identity_error = exc
+            _dpo_sync_step_begin_error(identity_error, context="producer attestation")
+            _dpo_check_consistent_across_ranks(self._dpo_producer_identity, context="producer identity")
+            provenance_options["expected_dpo_producer_identity"] = self._dpo_producer_identity
+        if tokenizer_fingerprint is not None:
+            provenance_options["audited_unpadded_tokenizer_sha256"] = tokenizer_fingerprint
         self.base.data_transform = build_data_transform(
             "dpo",
             tokenizer=self.policy_model.tokenizer,
@@ -546,59 +719,81 @@ class TextDPOTrainer:
 
     def dpo_provenance_checkpoint_state(self) -> dict[str, Any]:
         return {
-            "version": 3,
+            "version": 7,
             "enabled": self.base.args.dpo_config.explicit_segment_provenance,
             "plaintext_transform_version": 1,
+            "conversation_transform_version": 1,
             "objective_normalization": "global_pair_mean_v1",
+            "producer_contract_version": 1,
+            "audited_unpadded_tokenizer_sha256": self._dpo_objective_parameters["audited_unpadded_tokenizer_sha256"],
+            "producer_identity": self._dpo_producer_identity,
+            "transform_max_seq_len": self._dpo_transform_max_seq_len,
+            "objective_parameters": self._dpo_objective_parameters,
+            "recovery_geometry": self._dpo_recovery_geometry,
+            "steps_per_epoch": self.base.args.train_steps,
         }
 
     def validate_dpo_provenance_checkpoint(self, saved: Any) -> None:
         current = self.dpo_provenance_checkpoint_state()
-        if saved is None:
-            if (
-                not current["enabled"]
-                and self.base.args.dpo_config.allow_legacy_data_resume
-                and self.base.args.dpo_config.allow_legacy_objective_resume
-            ):
-                logger.warning_rank0(
-                    "Allowing non-exact legacy DPO resume: old data, optimizer and scheduler state may use "
-                    "different data semantics and loss normalization."
-                )
-                return
+        if _dpo_recovery_geometry(self.base.args) != current["recovery_geometry"]:
+            raise ValueError("DPO recovery geometry changed after initialization")
+        if current["recovery_geometry"]["data"]["dataset_name"] != "mapping":
             raise ValueError(
-                "legacy DPO trainer state has no data-semantics version; start from weights only, "
-                "or explicitly enable allow_legacy_data_resume and allow_legacy_objective_resume with provenance disabled"
+                "DPO trainer-state recovery requires a mapping dataset with a verified cursor; "
+                "iterable and multisource replay are not yet supported"
             )
-        if (
-            type(saved) is dict
-            and set(saved) == {"version", "enabled", "plaintext_transform_version"}
-            and type(saved["version"]) is int
-            and saved["version"] == 2
-            and type(saved["enabled"]) is bool
-            and type(saved["plaintext_transform_version"]) is int
-            and saved["plaintext_transform_version"] == 1
-        ):
-            if saved["enabled"] != current["enabled"]:
-                raise ValueError("DPO provenance mode must match the saved trainer state")
-            if not self.base.args.dpo_config.allow_legacy_objective_resume:
-                raise ValueError(
-                    "DPO checkpoint used legacy microbatch loss normalization; start from weights only or explicitly "
-                    "enable allow_legacy_objective_resume for a non-exact continuation"
-                )
-            logger.warning_rank0(
-                "Resuming legacy DPO optimizer state with global pair-mean normalization; "
-                "this is not equivalent to uninterrupted legacy training."
+        if current["enabled"] is not True:
+            raise ValueError("DPO checkpoint recovery requires explicit segment provenance")
+        actual_identity = dpo_producer_identity(
+            self.policy_model.tokenizer,
+            self.policy_model.chat_template,
+            getattr(self.base.args.dpo_config, "audited_unpadded_tokenizer_sha256", None),
+        )
+        if actual_identity != current["producer_identity"]:
+            raise ValueError("DPO producer identity changed before checkpoint recovery")
+        if saved is None:
+            raise ValueError(
+                "legacy DPO trainer state has no data-semantics version; start from weights only "
+                "or perform an independently verified migration to required provenance"
             )
-            return
         if (
             type(saved) is not dict
-            or set(saved) != {"version", "enabled", "plaintext_transform_version", "objective_normalization"}
+            or set(saved)
+            != {
+                "version",
+                "enabled",
+                "plaintext_transform_version",
+                "conversation_transform_version",
+                "objective_normalization",
+                "producer_contract_version",
+                "audited_unpadded_tokenizer_sha256",
+                "producer_identity",
+                "transform_max_seq_len",
+                "objective_parameters",
+                "recovery_geometry",
+                "steps_per_epoch",
+            }
             or type(saved["version"]) is not int
-            or saved["version"] != 3
+            or saved["version"] != 7
             or type(saved["enabled"]) is not bool
             or type(saved["plaintext_transform_version"]) is not int
             or saved["plaintext_transform_version"] != 1
+            or type(saved["conversation_transform_version"]) is not int
+            or saved["conversation_transform_version"] != 1
             or saved["objective_normalization"] != "global_pair_mean_v1"
+            or type(saved["producer_contract_version"]) is not int
+            or saved["producer_contract_version"] != 1
+            or (
+                saved["audited_unpadded_tokenizer_sha256"] is not None
+                and type(saved["audited_unpadded_tokenizer_sha256"]) is not str
+            )
+            or type(saved["producer_identity"]) is not dict
+            or type(saved["transform_max_seq_len"]) is not int
+            or saved["transform_max_seq_len"] <= 0
+            or type(saved["objective_parameters"]) is not dict
+            or type(saved["recovery_geometry"]) is not dict
+            or type(saved["steps_per_epoch"]) is not int
+            or saved["steps_per_epoch"] <= 0
         ):
             raise ValueError("Unsupported DPO data-semantics checkpoint protocol")
         if current != saved:
@@ -688,7 +883,9 @@ class TextDPOTrainer:
         Returns:
             (chosen_logps, rejected_logps) each of shape ``(B,)``.
         """
-        provenance_enabled = getattr(self.base.args.dpo_config, "explicit_segment_provenance", False)
+        provenance_enabled = getattr(self, "_dpo_provenance_required", False) or getattr(
+            self.base.args.dpo_config, "explicit_segment_provenance", False
+        )
         approved = micro_batch.get(DPO_APPROVED_KEY) if provenance_enabled else None
         if provenance_enabled and (
             not isinstance(approved, DPOPackedProof) or micro_batch.get(DPO_POSTCHECK_KEY) != approved
@@ -832,15 +1029,27 @@ class TextDPOTrainer:
             return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.state.global_step += 1
+        required = getattr(self, "_dpo_provenance_required", False)
+        if required:
+            config_error = None
+            try:
+                if self.base.args.dpo_config.explicit_segment_provenance is not True:
+                    raise ValueError("DPO segment provenance cannot be disabled after trainer initialization")
+                if _dpo_objective_parameters(self.base.args.dpo_config) != self._dpo_objective_parameters:
+                    raise ValueError("DPO objective parameters cannot change after trainer initialization")
+            except Exception as exc:  # noqa: BLE001 - synchronize malformed rank-local configuration
+                config_error = exc
+            _dpo_sync_step_begin_error(config_error, context="configuration")
+        provenance_enabled = required or self.base.args.dpo_config.explicit_segment_provenance
+        next_step = self.state.global_step + 1
 
         loader_error = None
-        if self.base.args.dpo_config.explicit_segment_provenance:
+        if provenance_enabled:
             micro_batches = next_dpo_microbatches(
                 data_iterator,
                 self.policy_model.parallel_state,
                 self.reference_model.parallel_state,
-                self.state.global_step,
+                next_step,
                 self.state.epoch,
                 source_catalog=lambda: (
                     tuple(self.environ_meter.multisource_tracker.names)
@@ -859,25 +1068,28 @@ class TextDPOTrainer:
             micro_batches,
             self.post_forward,
             self.policy_model.parallel_state,
-            self.base.args.dpo_config.explicit_segment_provenance,
+            provenance_enabled,
             loader_error=loader_error,
             backward_hook=self.forward_backward_step,
             vocab_size=self._dpo_vocabulary_size,
         )
+        # An exhausted iterable does not perform an optimizer update. Advance
+        # only after all ranks have obtained and validated this step's data.
+        self.state.global_step = next_step
 
-        expected_proofs = (
-            tuple(batch[DPO_APPROVED_KEY] for batch in micro_batches)
-            if self.base.args.dpo_config.explicit_segment_provenance
-            else None
-        )
+        expected_proofs = tuple(batch[DPO_APPROVED_KEY] for batch in micro_batches) if provenance_enabled else None
         step_begin_error = None
         try:
             self.base._reset_async_activation_offload_if_enabled(self.policy_model)
             self.on_step_begin(micro_batches=micro_batches)
+            if required and self.base.args.dpo_config.explicit_segment_provenance is not True:
+                raise ValueError("DPO segment provenance cannot be disabled during a callback")
+            if required and _dpo_objective_parameters(self.base.args.dpo_config) != self._dpo_objective_parameters:
+                raise ValueError("DPO objective parameters cannot change during a callback")
         except Exception as exc:  # noqa: BLE001 - report a local callback error to every rank before forwarding
             step_begin_error = exc
         _dpo_sync_step_begin_error(step_begin_error)
-        if self.base.args.dpo_config.explicit_segment_provenance:
+        if provenance_enabled:
             next_dpo_microbatches(
                 iter([micro_batches]),
                 self.policy_model.parallel_state,
@@ -919,6 +1131,7 @@ class TextDPOTrainer:
         self.policy_model.lr_scheduler.step()
         self.policy_model.optimizer.zero_grad()
 
+        self._dpo_epoch_step = getattr(self, "_dpo_epoch_step", 0) + 1
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def train(self):
@@ -932,10 +1145,19 @@ class TextDPOTrainer:
             f"Train epochs: {args.train.num_train_epochs}."
         )
 
+        if getattr(self, "_dpo_pending_epoch_end", None) is not None:
+            self.state.epoch, self._dpo_epoch_step = self._dpo_pending_epoch_end
+            self._dpo_epoch_complete = True
+            self.on_epoch_end()
+            self._dpo_pending_epoch_end = None
+            self._dpo_pending_loader_state = None
+
         for epoch in range(self.start_epoch, args.train.num_train_epochs):
             if hasattr(self.base.train_dataloader, "set_epoch"):
                 self.base.train_dataloader.set_epoch(epoch)
             self.state.epoch = epoch
+            self._dpo_epoch_step = self.start_step
+            self._dpo_epoch_complete = False
 
             self.on_epoch_begin()
 
@@ -951,6 +1173,7 @@ class TextDPOTrainer:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
+            self._dpo_epoch_complete = True
             self.on_epoch_end()
 
             self.start_step = 0
@@ -960,7 +1183,7 @@ class TextDPOTrainer:
 
         self.on_train_end()
 
-        if args.data.dataloader.use_background_prefetcher:
+        if args.data.dataloader.use_background_prefetcher and hasattr(self.base, "data_iterator"):
             self.base.data_iterator.stop()
 
         synchronize()

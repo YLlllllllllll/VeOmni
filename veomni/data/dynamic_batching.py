@@ -285,6 +285,8 @@ class DynamicBatchSizeDataLoader:
         self._drop_last = drop_last
         self._data_iter: Iterator
         self._resume = False
+        self._checkpoint_phase = "running"
+        self._checkpoint_flush_micro_batch = None
         self._batch_data_iter: Generator
 
         if length > 0:
@@ -303,6 +305,8 @@ class DynamicBatchSizeDataLoader:
     def __iter__(self) -> Iterator:
         if not self._resume:
             self.step = 0
+            self._checkpoint_phase = "running"
+            self._checkpoint_flush_micro_batch = None
             self._data_iter = iter(self._dataloader)
             self._batch_data_iter = self.batch_data_generator()
         self._resume = False
@@ -313,46 +317,47 @@ class DynamicBatchSizeDataLoader:
 
     def batch_data_generator(self):
         batch = []
+        if self._checkpoint_phase == "done":
+            return
+        if self._checkpoint_phase == "flushing":
+            yield from self._flush_remaining(batch, self._checkpoint_flush_micro_batch)
+            return
+        after_yield = self._checkpoint_phase == "after_yield"
+        self._checkpoint_phase = "running"
 
         while True:
-            if self._length and self.step >= self._length:
-                return
+            if not after_yield:
+                if self._length and self.step >= self._length:
+                    return
 
-            if self.batching_strategy.is_ready_for_micro_batch():
-                micro_batch = self.batching_strategy.get_micro_batch(self.step)
-                if self._collate_fn:
-                    micro_batch = self._collate_fn(micro_batch)
-                batch.append(micro_batch)
-                if len(batch) == self.num_micro_batch:
-                    yield batch
-                    self.step += 1
-                    batch = []
+                if self.batching_strategy.is_ready_for_micro_batch():
+                    micro_batch = self.batching_strategy.get_micro_batch(self.step)
+                    if self._collate_fn:
+                        micro_batch = self._collate_fn(micro_batch)
+                    batch.append(micro_batch)
+                    if len(batch) == self.num_micro_batch:
+                        self.step += 1
+                        self._checkpoint_phase = "after_yield"
+                        yield batch
+                        self._checkpoint_phase = "running"
+                        batch = []
+            after_yield = False
 
             try:
                 processing_item = next(self._data_iter)
             except Exception as e:
                 if isinstance(e, StopIteration):
                     if self.step < self._length:
+                        if getattr(self, "_dpo_disallow_implicit_restart", False):
+                            raise RuntimeError(
+                                "DPO dynamic loader exhausted before its configured length; "
+                                "implicit data replay is disabled"
+                            ) from e
                         # call iter until reach length
                         self._data_iter = iter(self._dataloader)
                         processing_item = next(self._data_iter)
                     elif not self._drop_last and not self.batching_strategy.empty():
-                        while not self.batching_strategy.empty():
-                            micro_batch = self.batching_strategy.get_micro_batch(self.step)
-                            if self._collate_fn:
-                                micro_batch = self._collate_fn(micro_batch)
-                            batch.append(micro_batch)
-                            if len(batch) == self.num_micro_batch:
-                                yield batch
-                                self.step += 1
-                                batch = []
-
-                        while len(batch) < self.num_micro_batch:
-                            padding_batch = copy.deepcopy(micro_batch)
-                            padding_batch["padding_flag"] = True
-                            batch.append(padding_batch)
-                        yield batch
-                        self.step += 1
+                        yield from self._flush_remaining(batch, None)
                         return
                     else:
                         return
@@ -367,6 +372,28 @@ class DynamicBatchSizeDataLoader:
             for item in processing_item:
                 self.batching_strategy.put_item(item)
 
+    def _flush_remaining(self, batch, micro_batch):
+        while not self.batching_strategy.empty():
+            micro_batch = self.batching_strategy.get_micro_batch(self.step)
+            if self._collate_fn:
+                micro_batch = self._collate_fn(micro_batch)
+            batch.append(micro_batch)
+            if len(batch) == self.num_micro_batch:
+                self.step += 1
+                self._checkpoint_phase = "flushing"
+                self._checkpoint_flush_micro_batch = micro_batch
+                yield batch
+                batch = []
+
+        while len(batch) < self.num_micro_batch:
+            padding_batch = copy.deepcopy(micro_batch)
+            padding_batch["padding_flag"] = True
+            batch.append(padding_batch)
+        self.step += 1
+        self._checkpoint_phase = "done"
+        self._checkpoint_flush_micro_batch = None
+        yield batch
+
     def state_dict(self):
         # save state
         state = self.__dict__.copy()
@@ -374,6 +401,9 @@ class DynamicBatchSizeDataLoader:
         for k in list(state.keys()):
             if k.startswith("_"):
                 del state[k]
+        state["_veomni_resume_phase"] = self._checkpoint_phase
+        if self._checkpoint_phase == "flushing":
+            state["_veomni_flush_micro_batch"] = self._checkpoint_flush_micro_batch
 
         # save dataloader state
         if hasattr(self._dataloader, "state_dict"):
@@ -388,6 +418,16 @@ class DynamicBatchSizeDataLoader:
         return copy.deepcopy(state)
 
     def load_state_dict(self, state: Dict[str, Any]):
+        state = copy.deepcopy(state)
+        self._checkpoint_phase = state.pop("_veomni_resume_phase", None)
+        if self._checkpoint_phase is None:
+            logger.warning("Legacy dynamic loader cursor lacks its post-yield phase; exact resume is not guaranteed.")
+            self._checkpoint_phase = "running"
+        self._checkpoint_flush_micro_batch = state.pop("_veomni_flush_micro_batch", None)
+        if self._checkpoint_phase not in ("running", "after_yield", "flushing", "done"):
+            raise ValueError("invalid dynamic loader resume phase")
+        if self._checkpoint_phase == "flushing" and self._checkpoint_flush_micro_batch is None:
+            raise ValueError("dynamic loader flushing resume requires the preceding microbatch")
         if state["num_micro_batch"] != self.num_micro_batch:
             logger.warning(
                 f"num_micro_batch changed: [ {state['num_micro_batch']} -> {self.num_micro_batch} ], will clear prefetch buffer"
@@ -409,6 +449,27 @@ class DynamicBatchSizeDataLoader:
 
         self._data_iter = iter(self._dataloader)
         self._batch_data_iter = self.batch_data_generator()
+
+    def load_next_epoch_buffer(self, state: Dict[str, Any]) -> None:
+        """Keep buffered samples while leaving the new epoch's sampler fresh."""
+        state = copy.deepcopy(state)
+        if state.get("num_micro_batch") != self.num_micro_batch:
+            raise ValueError("dynamic loader microbatch geometry differs from the checkpoint")
+        if state.get("_veomni_resume_phase") not in ("running", "after_yield", "flushing", "done"):
+            raise ValueError("invalid dynamic loader resume phase")
+        if ("batching_strategy" in state) == ("batching_strategy_state" in state):
+            raise ValueError("dynamic loader checkpoint must contain exactly one batching strategy state")
+        state.pop("dataloader_state", None)
+        state.pop("_veomni_resume_phase")
+        state.pop("_veomni_flush_micro_batch", None)
+        strategy_state = state.pop("batching_strategy_state", None)
+        self.__dict__.update(state)
+        if strategy_state is not None:
+            self.batching_strategy.load_state_dict(strategy_state)  # type: ignore
+        self.step = 0
+        self._resume = False
+        self._checkpoint_phase = "running"
+        self._checkpoint_flush_micro_batch = None
 
     def set_epoch(self, epoch: int) -> None:
         if hasattr(self._dataloader, "set_epoch"):

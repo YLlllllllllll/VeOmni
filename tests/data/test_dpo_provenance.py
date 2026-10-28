@@ -26,6 +26,9 @@ from veomni.utils.dpo_provenance import (
     DPO_POSTCHECK_KEY,
     DPO_PROOF_KEY,
     DPOInvalidProof,
+    dpo_declared_producer_identity,
+    dpo_tokenizer_fingerprint,
+    packed_batch_digest,
 )
 
 
@@ -33,16 +36,538 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class Tokenizer:
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "test-tokenizer-v1"
+
     def encode(self, text, add_special_tokens=True):
         return list(range(1, len(text) + 1))
+
+
+def test_dpo_training_requires_provenance_by_default(monkeypatch):
+    import veomni.trainer.text_dpo_trainer as dpo
+
+    assert dpo.DPOConfig().explicit_segment_provenance is True
+    monkeypatch.setattr(dpo.BaseTrainer, "_setup", lambda *_: "cpu")
+    args = SimpleNamespace(dpo_config=SimpleNamespace(explicit_segment_provenance=False))
+    with pytest.raises(ValueError, match="requires explicit_segment_provenance"):
+        dpo.TextDPOTrainer(args)
+
+
+def test_unknown_tokenizer_is_rejected_when_provenance_is_required():
+    class UnknownTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2]
+
+    with pytest.raises(ValueError, match="tokenizer must declare"):
+        process_dpo_example(
+            {"chosen": "a", "rejected": "b"}, tokenizer=UnknownTokenizer(), record_segment_provenance=True
+        )
+
+
+def test_declared_tokenizer_with_slots_is_supported():
+    class SlotTokenizer:
+        __slots__ = ()
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-slots-v1"
+
+        def encode(self, text, add_special_tokens=True):
+            return list(range(1, len(text) + 1))
+
+    feature = process_dpo_example(
+        {"chosen": "abc", "rejected": "de"}, tokenizer=SlotTokenizer(), record_segment_provenance=True
+    )[0]
+    assert feature[DPO_FEATURE_KEY].producer_contract_version == 1
+
+
+def test_untrusted_hf_subclass_cannot_inherit_tokenizer_contract():
+    from transformers import PreTrainedTokenizerFast
+
+    class OpaqueTokenizer(PreTrainedTokenizerFast):
+        def encode(self, text, add_special_tokens=True):
+            return [0, 0, 1, 2]
+
+    with pytest.raises(ValueError, match="tokenizer must declare"):
+        process_dpo_example(
+            {"chosen": "a", "rejected": "b"},
+            tokenizer=object.__new__(OpaqueTokenizer),
+            record_segment_provenance=True,
+        )
+
+
+def test_fast_tokenizer_requires_fingerprint_of_its_audited_backend():
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.processors import TemplateProcessing
+    from transformers import PreTrainedTokenizerFast
+
+    backend = BackendTokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1, "a": 2, "b": 3}, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    backend.enable_padding(length=8, pad_id=1, pad_token="[PAD]")
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", pad_token="[PAD]")
+    example = {"chosen": "a b", "rejected": "a a"}
+    fingerprint = dpo_tokenizer_fingerprint(tokenizer)
+    with pytest.raises(ValueError, match="audited_unpadded_tokenizer_sha256"):
+        process_dpo_example(example, tokenizer=tokenizer, record_segment_provenance=True)
+    feature = process_dpo_example(
+        example,
+        tokenizer=tokenizer,
+        record_segment_provenance=True,
+        audited_unpadded_tokenizer_sha256=fingerprint,
+    )[0]
+    assert feature["input_ids"].tolist() == [2, 3, 2, 2]
+    # encode normalizes transient backend padding; this must not invalidate the attestation.
+    assert dpo_tokenizer_fingerprint(tokenizer) == fingerprint
+    repeated = process_dpo_example(
+        example,
+        tokenizer=tokenizer,
+        record_segment_provenance=True,
+        audited_unpadded_tokenizer_sha256=fingerprint,
+    )[0]
+    assert repeated["input_ids"].tolist() == [2, 3, 2, 2]
+
+    original_tokens = tokenizer.encode("a [PAD]")
+    tokenizer.split_special_tokens = True
+    assert tokenizer.encode("a [PAD]") != original_tokens
+    with pytest.raises(ValueError, match="audited_unpadded_tokenizer_sha256"):
+        process_dpo_example(
+            example,
+            tokenizer=tokenizer,
+            record_segment_provenance=True,
+            audited_unpadded_tokenizer_sha256=fingerprint,
+        )
+    tokenizer.split_special_tokens = False
+
+    tokenizer.backend_tokenizer.post_processor = TemplateProcessing(
+        single="[PAD] [PAD] $A", special_tokens=[("[PAD]", 1)]
+    )
+    assert tokenizer.encode("a") == [1, 1, 2]
+    with pytest.raises(ValueError, match="audited_unpadded_tokenizer_sha256"):
+        process_dpo_example(
+            example,
+            tokenizer=tokenizer,
+            record_segment_provenance=True,
+            audited_unpadded_tokenizer_sha256=fingerprint,
+        )
+
+
+def test_class_level_producer_replacement_changes_identity(monkeypatch):
+    from veomni.data.chat_template import ChatmlTemplate
+
+    tokenizer = Tokenizer()
+    template = ChatmlTemplate(tokenizer)
+    tokenizer_identity = dpo_declared_producer_identity(tokenizer, "tokenizer")
+    template_identity = dpo_declared_producer_identity(template, "chat template")
+    monkeypatch.setattr(Tokenizer, "encode", lambda self, text, add_special_tokens=True: [0, 0, 1])
+    monkeypatch.setattr(ChatmlTemplate, "encode_messages", lambda self, *_args, **_kwargs: {"input_ids": [0, 0, 1]})
+    assert dpo_declared_producer_identity(tokenizer, "tokenizer") != tokenizer_identity
+    assert dpo_declared_producer_identity(template, "chat template") != template_identity
+
+
+def test_fast_tokenizer_rejects_instance_encode_plus_replacement():
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    backend = BackendTokenizer(WordLevel({"[UNK]": 0, "a": 1}, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    fingerprint = dpo_tokenizer_fingerprint(tokenizer)
+    tokenizer._encode_plus = lambda *_args, **_kwargs: {"input_ids": [0, 0, 1]}
+    with pytest.raises(ValueError, match="instance-overridden"):
+        process_dpo_example(
+            {"chosen": "a", "rejected": "a"},
+            tokenizer=tokenizer,
+            record_segment_provenance=True,
+            audited_unpadded_tokenizer_sha256=fingerprint,
+        )
+
+
+@pytest.mark.parametrize("family", ["llama", "gpt2"])
+def test_audited_standard_tokenizers_can_emit_provenance(family):
+    from transformers.models.gpt2.tokenization_gpt2 import GPT2Tokenizer
+    from transformers.models.llama.tokenization_llama import LlamaTokenizer
+
+    tokenizer = (
+        LlamaTokenizer(vocab={"<unk>": 0, "<s>": 1, "</s>": 2, "a": 3, "b": 4, "▁": 5}, merges=[])
+        if family == "llama"
+        else GPT2Tokenizer(vocab={"<|endoftext|>": 0, "a": 1, "b": 2}, merges=[])
+    )
+    fingerprint = dpo_tokenizer_fingerprint(tokenizer)
+    feature = process_dpo_example(
+        {"chosen": "a b", "rejected": "a a"},
+        tokenizer=tokenizer,
+        record_segment_provenance=True,
+        audited_unpadded_tokenizer_sha256=fingerprint,
+    )[0]
+    assert feature[DPO_FEATURE_KEY].producer_contract_version == 1
+
+
+def test_qwen_fingerprint_uses_the_training_processor_path(tmp_path):
+    from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+    from transformers.processing_utils import ProcessorMixin
+
+    from veomni.models.auto import build_processor
+
+    original = Qwen2Tokenizer(vocab={"<|endoftext|>": 0, "a": 1, "b": 2}, merges=[])
+    original.save_pretrained(tmp_path)
+    documented = build_processor(str(tmp_path))
+    training = build_processor(str(tmp_path))
+    documented_tokenizer = documented.tokenizer if isinstance(documented, ProcessorMixin) else documented
+    training_tokenizer = training.tokenizer if isinstance(training, ProcessorMixin) else training
+    fingerprint = dpo_tokenizer_fingerprint(documented_tokenizer)
+    assert dpo_tokenizer_fingerprint(training_tokenizer) == fingerprint
+    feature = process_dpo_example(
+        {"chosen": "a b", "rejected": "a a"},
+        tokenizer=training_tokenizer,
+        record_segment_provenance=True,
+        audited_unpadded_tokenizer_sha256=fingerprint,
+    )[0]
+    assert feature[DPO_FEATURE_KEY].producer_contract_version == 1
+
+
+def test_opaque_chat_template_cannot_claim_physical_lengths_as_padding_proof():
+    class OpaqueTemplate:
+        def encode_messages(self, messages, max_seq_len):
+            return {"input_ids": [0, 0, 1, 2, 3], "labels": [-100, -100, 1, 2, 3], "attention_mask": [1] * 5}
+
+    with pytest.raises(ValueError, match="chat template must declare"):
+        process_dpo_example(
+            {"chosen": [{"role": "assistant", "content": "a"}], "rejected": [{"role": "assistant", "content": "b"}]},
+            chat_template=OpaqueTemplate(),
+            record_segment_provenance=True,
+        )
+
+
+def test_builtin_chatml_declares_unpadded_contract():
+    from veomni.data.chat_template import ChatmlTemplate
+
+    sample = process_dpo_example(
+        {"chosen": [{"role": "assistant", "content": "a"}], "rejected": [{"role": "assistant", "content": "b"}]},
+        chat_template=ChatmlTemplate(Tokenizer()),
+        record_segment_provenance=True,
+    )[0]
+    assert sample[DPO_FEATURE_KEY].chosen > 0
+    assert sample[DPO_FEATURE_KEY].rejected > 0
+
+
+def test_untrusted_subclass_cannot_inherit_builtin_template_contract():
+    from veomni.data.chat_template import ChatmlTemplate
+
+    class OpaqueSubclass(ChatmlTemplate):
+        def encode_messages(self, messages, max_seq_len):
+            return {"input_ids": [0, 0, 1, 2, 3], "labels": [-100, -100, 1, 2, 3], "attention_mask": [1] * 5}
+
+    with pytest.raises(ValueError, match="chat template must declare"):
+        process_dpo_example(
+            {"chosen": [{"role": "assistant", "content": "a"}], "rejected": [{"role": "assistant", "content": "b"}]},
+            chat_template=OpaqueSubclass(Tokenizer()),
+            record_segment_provenance=True,
+        )
+
+
+@pytest.mark.parametrize("producer_kind", ["tokenizer", "template"])
+def test_declared_producer_rejects_instance_method_overrides(producer_kind):
+    from veomni.data.chat_template import ChatmlTemplate
+
+    tokenizer = Tokenizer()
+    if producer_kind == "tokenizer":
+        tokenizer.encode = lambda text, add_special_tokens=True: [0, 0, 1]
+        args = {"tokenizer": tokenizer, "example": {"chosen": "a", "rejected": "b"}}
+    else:
+        template = ChatmlTemplate(tokenizer)
+        template.encode_messages = lambda *_args, **_kwargs: {"input_ids": [0, 0, 1]}
+        args = {
+            "chat_template": template,
+            "example": {"chosen": [{"role": "assistant", "content": "a"}], "rejected": []},
+        }
+    with pytest.raises(ValueError, match="instance-overridden"):
+        process_dpo_example(**args, record_segment_provenance=True)
+
+
+@pytest.mark.parametrize("ignored_branch", ["chosen", "rejected"])
+def test_conversation_pair_rejects_branch_with_no_supervision(ignored_branch):
+    class Template:
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-conversation-v1"
+
+        def encode_messages(self, messages, max_seq_len):
+            return {
+                "input_ids": [1, 2],
+                "attention_mask": [1, 1],
+                "labels": [-100, -100 if messages[0]["content"] == ignored_branch else 2],
+            }
+
+    with pytest.raises(ValueError, match="each contain supervised tokens"):
+        process_dpo_example(
+            {
+                "chosen": [{"role": "assistant", "content": "chosen"}],
+                "rejected": [{"role": "assistant", "content": "rejected"}],
+            },
+            chat_template=Template(),
+            record_segment_provenance=True,
+        )
+
+
+def test_conversation_pair_rejects_pre_shifted_labels():
+    class Template:
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-conversation-v1"
+
+        def encode_messages(self, messages, max_seq_len):
+            return {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [-100, 3, 3]}
+
+    with pytest.raises(ValueError, match="labels must be unshifted"):
+        process_dpo_example(
+            {
+                "chosen": [{"role": "assistant", "content": "chosen"}],
+                "rejected": [{"role": "assistant", "content": "rejected"}],
+            },
+            chat_template=Template(),
+            record_segment_provenance=True,
+        )
+
+
+def test_conversation_pair_rejects_supervision_only_on_first_token():
+    class Template:
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-conversation-v1"
+
+        def encode_messages(self, messages, max_seq_len):
+            return {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, -100, -100]}
+
+    with pytest.raises(ValueError, match="causal prediction target"):
+        process_dpo_example(
+            {
+                "chosen": [{"role": "assistant", "content": "chosen"}],
+                "rejected": [{"role": "assistant", "content": "rejected"}],
+            },
+            chat_template=Template(),
+            record_segment_provenance=True,
+        )
+
+
+def test_conversation_pair_masks_shared_multiturn_history_without_mutating_input():
+    from copy import deepcopy
+
+    from veomni.data.chat_template import ChatmlTemplate
+
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "previous answer"},
+        {"role": "user", "content": "second question"},
+    ]
+    chosen = history + [{"role": "assistant", "content": "preferred response"}]
+    rejected = history + [{"role": "assistant", "content": "worse response"}]
+    example = {"chosen": chosen, "rejected": rejected}
+    untouched = deepcopy(example)
+    template = ChatmlTemplate(Tokenizer())
+    feature = process_dpo_example(example, chat_template=template, record_segment_provenance=True)[0]
+    marker = feature[DPO_FEATURE_KEY]
+    prefix = template.encode_messages([dict(message, loss_mask=0) for message in history], max_seq_len=2048)
+    prefix_len = len(prefix["input_ids"])
+    assert bool((feature["labels"][:prefix_len] == -100).all())
+    assert bool((feature["labels"][marker.chosen : marker.chosen + prefix_len] == -100).all())
+    assert bool((feature["labels"][prefix_len : marker.chosen] != -100).any())
+    assert bool((feature["labels"][marker.chosen + prefix_len :] != -100).any())
+    assert example == untouched
+
+
+@pytest.mark.parametrize("template_name", ["DefaultTemplate", "Llama2Template"])
+def test_builtin_conversation_templates_accept_missing_loss_masks(template_name):
+    from veomni.data import chat_template as templates
+
+    class TemplateTokenizer(Tokenizer):
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-template-tokenizer-v1"
+        eos_token = "<eos>"
+        bos_token = "<bos>"
+
+    template = getattr(templates, template_name)(TemplateTokenizer())
+    history = [{"role": "user", "content": "question"}]
+    feature = process_dpo_example(
+        {
+            "chosen": history + [{"role": "assistant", "content": "yes"}],
+            "rejected": history + [{"role": "assistant", "content": "no"}],
+        },
+        chat_template=template,
+        record_segment_provenance=True,
+    )[0]
+    prefix = template.encode_messages([dict(message, loss_mask=0) for message in history], max_seq_len=2048)
+    assert bool((feature["labels"][: len(prefix["input_ids"])] == -100).all())
+
+
+def test_conversation_pair_rejects_template_ignoring_sequence_limit():
+    import sys
+
+    from veomni.data.chat_template import ChatmlTemplate
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    class IgnoringLimitTemplate(ChatmlTemplate):
+        def encode_messages(self, messages, max_seq_len):
+            return super().encode_messages(messages, max_seq_len=sys.maxsize)
+
+    example = {
+        "chosen": [{"role": "user", "content": "question"}, {"role": "assistant", "content": "yes"}],
+        "rejected": [{"role": "user", "content": "question"}, {"role": "assistant", "content": "no"}],
+    }
+    with pytest.raises(ValueError, match="truncation"):
+        _dpo_conversation_encodings(IgnoringLimitTemplate(Tokenizer()), example["chosen"], example["rejected"], 4)
+
+
+def test_conversation_pair_masks_non_assistant_completion_messages():
+    from veomni.data.chat_template import ChatmlTemplate
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    template = ChatmlTemplate(Tokenizer())
+    prompt = [{"role": "user", "content": "question"}]
+    chosen = prompt + [
+        {"role": "assistant", "content": "call a"},
+        {"role": "tool", "content": "tool output", "loss_mask": 1},
+        {"role": "assistant", "content": "answer a"},
+    ]
+    rejected = prompt + [
+        {"role": "assistant", "content": "call b"},
+        {"role": "tool", "content": "other output", "loss_mask": 1},
+        {"role": "assistant", "content": "answer b"},
+    ]
+    encoded, _ = _dpo_conversation_encodings(template, chosen, rejected, 2048)
+    start = len(template.encode_messages(chosen[:2], max_seq_len=2048)["input_ids"])
+    end = len(template.encode_messages(chosen[:3], max_seq_len=2048)["input_ids"])
+    assert start < end
+    assert bool((encoded["labels"][start:end] == -100).all())
+    assert bool((encoded["labels"][end:] != -100).any())
+    assert chosen[2]["loss_mask"] == 1
+
+
+def test_conversation_pair_rejects_template_ignoring_non_assistant_mask():
+    from veomni.data.chat_template import ChatmlTemplate
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    class IgnoringToolMaskTemplate(ChatmlTemplate):
+        def encode_messages(self, messages, max_seq_len):
+            messages = [
+                dict(message, loss_mask=1) if message.get("role") == "tool" else message for message in messages
+            ]
+            return super().encode_messages(messages, max_seq_len=max_seq_len)
+
+    prompt = [{"role": "user", "content": "question"}]
+    chosen = prompt + [{"role": "assistant", "content": "a"}, {"role": "tool", "content": "tool output"}]
+    rejected = prompt + [{"role": "assistant", "content": "b"}, {"role": "tool", "content": "tool output"}]
+    with pytest.raises(ValueError, match="mask non-assistant"):
+        _dpo_conversation_encodings(IgnoringToolMaskTemplate(Tokenizer()), chosen, rejected, 2048)
+
+
+def test_conversation_pair_rejects_different_history():
+    from veomni.data.chat_template import ChatmlTemplate
+
+    example = {
+        "chosen": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "yes"}],
+        "rejected": [{"role": "user", "content": "b"}, {"role": "assistant", "content": "no"}],
+    }
+    with pytest.raises(ValueError, match="same prompt history"):
+        process_dpo_example(example, chat_template=ChatmlTemplate(Tokenizer()), record_segment_provenance=True)
+
+
+def test_conversation_pair_rejects_different_truncated_contexts():
+    from veomni.data.chat_template import ChatmlTemplate
+
+    history = [{"role": "user", "content": "q" * 30}]
+    example = {
+        "chosen": history + [{"role": "assistant", "content": "x" * 14}],
+        "rejected": history + [{"role": "assistant", "content": "y" * 3}],
+    }
+    with pytest.raises(ValueError, match="contexts differ after truncation"):
+        process_dpo_example(
+            example, chat_template=ChatmlTemplate(Tokenizer()), max_seq_len=80, record_segment_provenance=True
+        )
+
+
+def test_feature_content_mutation_and_old_metadata_are_rejected(monkeypatch):
+    from dataclasses import replace
+
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    feature = _feature("abc", "def", 0)
+    feature["input_ids"][0] += 1
+    result = DPOProvenanceCollator(MainCollator())([feature])
+    assert isinstance(result[DPO_PROOF_KEY], DPOInvalidProof)
+
+    feature = _feature("abc", "def", 0)
+    feature[DPO_FEATURE_KEY] = replace(feature[DPO_FEATURE_KEY], producer_contract_version=0)
+    result = DPOProvenanceCollator(MainCollator())([feature])
+    assert isinstance(result[DPO_PROOF_KEY], DPOInvalidProof)
+
+
+def test_collator_rejects_even_signed_pre_shifted_labels(monkeypatch):
+    from dataclasses import replace
+
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    feature = _feature("abc", "def", 0)
+    feature["labels"][1] = feature["input_ids"][2]
+    feature[DPO_FEATURE_KEY] = replace(
+        feature[DPO_FEATURE_KEY],
+        feature_digest=packed_batch_digest(
+            feature, feature=True, include_keys=("input_ids", "labels", "position_ids", "attention_mask")
+        ),
+    )
+    result = DPOProvenanceCollator(MainCollator())([feature])
+    assert isinstance(result[DPO_PROOF_KEY], DPOInvalidProof)
 
 
 def test_dpo_config_keeps_existing_positional_argument_order():
     from veomni.trainer.text_dpo_trainer import DPOConfig
 
-    config = DPOConfig(0.1, 0.2)
+    config = DPOConfig(0.1, 0.2, True, "ipo", True, "float32", True, True, True)
     assert config.beta == 0.1 and config.label_smoothing == 0.2
-    assert config.explicit_segment_provenance is False
+    assert config.reference_free and config.loss_type == "ipo" and config.average_log_prob
+    assert config.refer_model_precision == "float32" and config.explicit_segment_provenance
+    assert config.allow_legacy_data_resume and config.allow_legacy_objective_resume
+    assert config.audited_unpadded_tokenizer_sha256 is None
+
+
+def test_audited_tokenizer_config_is_supported_by_cli_parser():
+    import argparse
+
+    from veomni.arguments.parser import _add_arguments_recursive
+    from veomni.trainer.text_dpo_trainer import DPOConfig
+
+    parser = argparse.ArgumentParser()
+    _add_arguments_recursive(parser, DPOConfig, prefix="dpo_config")
+    parsed = vars(parser.parse_args(["--dpo_config.audited_unpadded_tokenizer_sha256", "a" * 64]))
+    assert parsed["dpo_config.audited_unpadded_tokenizer_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("beta", 0),
+        ("beta", float("nan")),
+        ("beta", True),
+        ("label_smoothing", 1.1),
+        ("reference_free", "false"),
+        ("average_log_prob", 1),
+        ("loss_type", "typo"),
+        ("refer_model_precision", "fp16"),
+        ("audited_unpadded_tokenizer_sha256", "not-a-sha"),
+    ],
+)
+def test_invalid_dpo_objective_config_fails_closed(field, value):
+    from veomni.trainer.text_dpo_trainer import DPOConfig, _dpo_objective_parameters
+
+    config = DPOConfig()
+    setattr(config, field, value)
+    with pytest.raises(ValueError):
+        _dpo_objective_parameters(config)
+
+
+def test_ipo_rejects_ignored_label_smoothing():
+    from veomni.trainer.text_dpo_trainer import DPOConfig, _dpo_objective_parameters
+
+    with pytest.raises(ValueError, match="unsupported for IPO"):
+        _dpo_objective_parameters(DPOConfig(loss_type="ipo", label_smoothing=0.1))
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -63,6 +588,25 @@ def test_trainer_adds_transform_option_only_when_enabled(monkeypatch, enabled):
         assert captured["record_segment_provenance"] is True
     else:
         assert "record_segment_provenance" not in captured
+
+
+def test_dpo_registry_and_real_trainer_transform_produce_verified_features():
+    import veomni.trainer.text_dpo_trainer as dpo
+
+    tokenizer = Tokenizer()
+    trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
+    trainer._dpo_provenance_required = True
+    trainer.base = SimpleNamespace(
+        args=SimpleNamespace(dpo_config=dpo.DPOConfig(), data=SimpleNamespace(max_seq_len=32))
+    )
+    trainer.policy_model = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    trainer._build_data_transform()
+    feature = trainer.base.data_transform({"chosen": "abc", "rejected": "de"})[0]
+    assert feature[DPO_FEATURE_KEY].producer_contract_version == 1
+
+    tokenizer.encode = lambda text, add_special_tokens=True: [0, 0, 1]
+    with pytest.raises(ValueError, match="instance-overridden"):
+        trainer.base.data_transform({"chosen": "abc", "rejected": "de"})
 
 
 def _state(sp_enabled=False, rank=0):
@@ -242,13 +786,26 @@ def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, cha
 
 @pytest.mark.parametrize("key", ["input_ids", "labels"])
 def test_preflight_rejects_token_ids_outside_vocabulary(monkeypatch, key):
+    from dataclasses import replace
+
     import veomni.data.data_collator as m
     from veomni.trainer.dpo_provenance import next_dpo_microbatches
 
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
     feature = _feature("abc", "de", 0)
-    feature[key][-1] = 100
+    if key == "labels":
+        feature["labels"][-1] = 100
+        feature["input_ids"][-1] = 100
+    else:
+        feature["input_ids"][0] = 100
+        feature["labels"][0] = -100
+    feature[DPO_FEATURE_KEY] = replace(
+        feature[DPO_FEATURE_KEY],
+        feature_digest=packed_batch_digest(
+            feature, feature=True, include_keys=("input_ids", "labels", "position_ids", "attention_mask")
+        ),
+    )
     batch = DPOProvenanceCollator(MainCollator())([feature])
     with pytest.raises(RuntimeError, match="outside the model vocabulary"):
         next_dpo_microbatches(iter([[batch]]), state, state, global_step=1, vocab_size=lambda: 10)
@@ -390,6 +947,61 @@ def test_truncated_plaintext_prompt_rejects_lost_completions(monkeypatch, record
         assert batch[DPO_PROOF_KEY].segment_lengths == (3, 3)
 
 
+def test_plaintext_rejects_different_tokenized_contexts():
+    class BranchDependentTokenizer:
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test.branch-dependent-tokenizer.v1"
+
+        def encode(self, text, add_special_tokens=True):
+            return [1 if text.endswith("c") else 2, 4, 5]
+
+        def __call__(self, text, **kwargs):
+            return {
+                "input_ids": self.encode(text),
+                "offset_mapping": [(0, 1), (1, 3), (3, 4)],
+                "special_tokens_mask": [0, 0, 0],
+            }
+
+    with pytest.raises(ValueError, match="plaintext contexts differ"):
+        process_dpo_example(
+            {"prompt": "abc", "chosen": "c", "rejected": "r"},
+            tokenizer=BranchDependentTokenizer(),
+            record_segment_provenance=True,
+        )
+
+
+def test_plaintext_rejects_first_token_that_merges_prompt_and_completion():
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers import models
+    from transformers import PreTrainedTokenizerFast
+
+    vocabulary = {"[UNK]": 0, "a": 1, "b": 2, "c": 3, "z": 4, "ab": 5, "ac": 6}
+    backend = BackendTokenizer(models.BPE(vocab=vocabulary, merges=[("a", "b"), ("a", "c")], unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    assert tokenizer("abz", return_offsets_mapping=True)["offset_mapping"] == [(0, 2), (2, 3)]
+    with pytest.raises(ValueError, match="shared token before the prompt boundary"):
+        process_dpo_example(
+            {"prompt": "a", "chosen": "bz", "rejected": "cz"},
+            tokenizer=tokenizer,
+            record_segment_provenance=True,
+            audited_unpadded_tokenizer_sha256=dpo_tokenizer_fingerprint(tokenizer),
+        )
+
+
+def test_plaintext_without_prompt_rejects_different_first_context_token():
+    class TokenizerWithoutBos:
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-no-bos-v1"
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(value) for value in text]
+
+    with pytest.raises(ValueError, match="plaintext contexts differ"):
+        process_dpo_example(
+            {"chosen": "ab", "rejected": "cb"}, tokenizer=TokenizerWithoutBos(), record_segment_provenance=True
+        )
+
+
 @pytest.mark.parametrize("record_provenance", [False, True])
 def test_plaintext_prompt_completion_boundary_merge_is_scoreable(record_provenance):
     from tokenizers import Tokenizer as BackendTokenizer
@@ -412,11 +1024,13 @@ def test_plaintext_prompt_completion_boundary_merge_is_scoreable(record_provenan
     assert len(prompt) == len(chosen) == len(rejected) == 2
     assert prompt[0] == chosen[0] == rejected[0] and prompt[1] != chosen[1] != rejected[1]
 
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
     feature = process_dpo_example(
         {"prompt": "Hello ", "chosen": "world", "rejected": "there"},
-        tokenizer=PreTrainedTokenizerFast(tokenizer_object=backend),
+        tokenizer=tokenizer,
         max_seq_len=2048,
         record_segment_provenance=record_provenance,
+        audited_unpadded_tokenizer_sha256=dpo_tokenizer_fingerprint(tokenizer),
     )[0]
     assert feature["input_ids"].tolist() == chosen + rejected
     assert feature["labels"].tolist() == [-100, chosen[1], -100, rejected[1]]
@@ -578,21 +1192,56 @@ def test_slow_tokenizer_with_automatic_trailing_eos_keeps_completion():
             )
 
 
-def test_prepadding_is_not_reinterpreted_or_discarded(monkeypatch):
+def test_source_ignored_labels_and_collator_tail_stay_distinct(monkeypatch):
+    from dataclasses import replace
+
     import veomni.data.data_collator as m
 
     monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "def", 5)
-    # A producer may include ignored tokens within a physical segment.
-    feature["labels"][-2:] = -100
+    # Actual tokens may have ignored labels; that does not make them padding.
+    feature["labels"][-3] = -100
+    feature["labels"][-1] = -100
+    feature[DPO_FEATURE_KEY] = replace(
+        feature[DPO_FEATURE_KEY],
+        feature_digest=packed_batch_digest(
+            feature, feature=True, include_keys=("input_ids", "labels", "position_ids", "attention_mask")
+        ),
+    )
     batch = DPOProvenanceCollator(MainCollator(pad_to_length=8))([feature])
     proof = batch[DPO_PROOF_KEY]
     assert proof.segment_lengths == (3, 3)
     assert proof.collator_tail == 2
-    assert batch["labels"].flatten().tolist()[-4:] == [-100, -100, -100, -100]
+    assert batch["labels"].flatten().tolist()[-4:] == [2, -100, -100, -100]
 
 
-def test_dpo_single_token_pair_and_collator_tail_preserve_loss_gradients(monkeypatch):
+def test_dpo_single_token_segment_without_context_rejected_before_forward(monkeypatch):
+    import veomni.data.data_collator as m
+    from veomni.trainer.dpo_provenance import next_dpo_microbatches
+
+    state = _state()
+    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    features = [_feature("abc", "def", 1), _feature("g", "h", 2)]
+    batch = DPOProvenanceCollator(MainCollator(pad_to_length=10))(features)
+    with pytest.raises((ValueError, RuntimeError), match="causal prediction target"):
+        next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)
+
+
+def test_dpo_single_token_completion_with_context_remains_valid(monkeypatch):
+    import veomni.data.data_collator as m
+    from veomni.trainer.dpo_provenance import next_dpo_microbatches
+
+    state = _state()
+    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    feature = process_dpo_example(
+        {"prompt": "x", "chosen": "a", "rejected": "b"}, tokenizer=Tokenizer(), record_segment_provenance=True
+    )[0]
+    batch = DPOProvenanceCollator(MainCollator())([feature])
+    approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
+    assert approved[DPO_APPROVED_KEY].segment_lengths == (2, 2)
+
+
+def test_dpo_short_pair_and_collator_tail_preserve_loss_gradients(monkeypatch):
     import veomni.data.data_collator as m
     import veomni.trainer.text_dpo_trainer as dpo
     from veomni.trainer.dpo_provenance import next_dpo_microbatches
@@ -600,8 +1249,8 @@ def test_dpo_single_token_pair_and_collator_tail_preserve_loss_gradients(monkeyp
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
     monkeypatch.setattr(dpo, "get_parallel_state", lambda: state)
-    features = [_feature("abc", "def", 1), _feature("g", "h", 2)]
-    batch = DPOProvenanceCollator(MainCollator(pad_to_length=10))(features)
+    features = [_feature("abc", "def", 1), _feature("gh", "ij", 2)]
+    batch = DPOProvenanceCollator(MainCollator(pad_to_length=12))(features)
     approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
     next_dpo_microbatches(
         iter([[approved]]),
@@ -611,12 +1260,12 @@ def test_dpo_single_token_pair_and_collator_tail_preserve_loss_gradients(monkeyp
         after_callbacks=True,
         expected_proofs=(approved[DPO_APPROVED_KEY],),
     )
-    assert approved[DPO_APPROVED_KEY].segment_lengths == (3, 3, 1, 1)
+    assert approved[DPO_APPROVED_KEY].segment_lengths == (3, 3, 2, 2)
 
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.values = torch.nn.Parameter(-torch.arange(1, 11, dtype=torch.float32))
+            self.values = torch.nn.Parameter(-torch.arange(1, 13, dtype=torch.float32))
 
         def forward(self, input_ids, **kwargs):
             assert all(key not in kwargs for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_POSTCHECK_KEY))
@@ -634,8 +1283,8 @@ def test_dpo_single_token_pair_and_collator_tail_preserve_loss_gradients(monkeyp
     loss.mean().backward()
 
     reference = model.values.detach().clone().requires_grad_()
-    expected_chosen = torch.stack((reference[0] + reference[1], reference[6] * 0))
-    expected_rejected = torch.stack((reference[3] + reference[4], reference[7] * 0))
+    expected_chosen = torch.stack((reference[0] + reference[1], reference[6]))
+    expected_rejected = torch.stack((reference[3] + reference[4], reference[8]))
     expected_loss = -F.logsigmoid(0.1 * (expected_chosen - expected_rejected)).mean()
     expected_loss.backward()
     torch.testing.assert_close(chosen, expected_chosen, rtol=0, atol=0)
@@ -654,8 +1303,8 @@ def test_chunk_logprobs_matches_independent_dense_dpo_reference(monkeypatch):
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
     monkeypatch.setattr(dpo, "get_parallel_state", lambda: state)
     monkeypatch.setattr(chunk, "get_parallel_state", lambda: state)
-    features = [_feature("abc", "def", 1), _feature("g", "h", 2)]
-    batch = DPOProvenanceCollator(MainCollator(pad_to_length=10))(features)
+    features = [_feature("abc", "def", 1), _feature("gh", "ij", 2)]
+    batch = DPOProvenanceCollator(MainCollator(pad_to_length=12))(features)
     approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
     next_dpo_microbatches(
         iter([[approved]]),
@@ -692,7 +1341,7 @@ def test_chunk_logprobs_matches_independent_dense_dpo_reference(monkeypatch):
 
     tokens = approved["input_ids"][0]
     reference_logps = []
-    for start, end in ((0, 3), (3, 6), (6, 7), (7, 8)):
+    for start, end in ((0, 3), (3, 6), (6, 8), (8, 10)):
         sequence = tokens[start:end]
         if len(sequence) == 1:
             reference_logps.append(reference.head(reference.embedding(sequence)).sum() * 0)
@@ -735,7 +1384,7 @@ def test_post_callback_preflight_allows_metadata_removal_but_rejects_tensor_muta
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(MainCollator(channel_loss_source_id_keys=("ds_idx",)), require_ds_idx=True)(
-        [_feature("abc", "d", 0)]
+        [_feature("abc", "de", 0)]
     )
     next_dpo_microbatches(iter([[batch]]), state, state, global_step=1, source_count=lambda: 1, vocab_size=lambda: 16)
     batch.pop("ds_idx")
@@ -770,7 +1419,7 @@ def test_post_callback_preflight_rejects_metadata_addition_or_mutation(monkeypat
 
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
-    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "d", 0)])
+    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 0)])
     next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)
     if operation == "add":
         batch["cur_token_num"] = 12345
@@ -817,7 +1466,7 @@ def test_post_callback_preflight_rejects_removed_or_reordered_microbatch(monkeyp
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
     collator = DPOProvenanceCollator(MainCollator())
-    first, second = collator([_feature("abc", "d", 0)]), collator([_feature("ab", "de", 1)])
+    first, second = collator([_feature("abc", "de", 0)]), collator([_feature("ab", "de", 1)])
     batches = next_dpo_microbatches(iter([[first, second]]), state, state, global_step=1)
     expected = tuple(batch[DPO_APPROVED_KEY] for batch in batches)
     for altered in ([first], [second, first]):
@@ -833,7 +1482,7 @@ def test_step_begin_callback_failure_does_not_update_optimizer(monkeypatch):
 
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
-    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "d", 0)])
+    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 0)])
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(
@@ -862,7 +1511,9 @@ def test_shared_meter_ignores_proof_when_opt_in_is_disabled():
     from veomni.utils import helper
     from veomni.utils.dpo_provenance import DPOPackedProof
 
-    proof = DPOPackedProof((3, 1), (4,), 0, (None,), "a" * 64, "b" * 64, "c" * 64, "d" * 64)
+    proof = DPOPackedProof(
+        (3, 1), (4,), 0, (None,), "a" * 64, "b" * 64, "c" * 64, "d" * 64, producer_contract_version=1
+    )
     ordinary = {"cu_seq_lens_q": torch.tensor([0, 3, 4])}
     with_proof = {**ordinary, DPO_APPROVED_KEY: proof}
     assert helper._compute_seqlens(with_proof) == helper._compute_seqlens(ordinary)
@@ -877,7 +1528,7 @@ def test_world_packet_is_bounded_independently_of_microbatch_count(monkeypatch):
 
     state = _state()
     monkeypatch.setattr(m, "get_parallel_state", lambda: state)
-    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "d", 1)])
+    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 1)])
     original = protocol._validate_packets
     packets = []
 

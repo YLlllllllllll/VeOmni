@@ -1037,7 +1037,7 @@ derived argument groups below.
 
 `dpo_config.*` — Direct Preference Optimization hyperparameters.
 
-`dpo_config.explicit_segment_provenance` (experimental, default `false`) uses
+`dpo_config.explicit_segment_provenance` (experimental, default `true`) requires
 built-in DPO segment metadata to disambiguate one-token segments from padding.
 See the [DPO guide](../examples/qwen3_dpo.md#experimental-explicit-segment-provenance)
 for supported inputs, rank agreement, and checkpoint restrictions.
@@ -1050,8 +1050,9 @@ for supported inputs, rank agreement, and checkpoint restrictions.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
-| explicit_segment_provenance | `bool` | `False` | Experimental packed-segment provenance and rank agreement; validate on the target hardware. |
-| allow_legacy_data_resume | `bool` | `False` | Explicitly permit non-exact legacy DPO data resume only when provenance is disabled. |
-| allow_legacy_objective_resume | `bool` | `False` | Explicitly permit non-exact DPO resume after changing optimizer-step loss normalization. |
+| explicit_segment_provenance | `bool` | `True` | Required packed-segment provenance and rank agreement; validate on the target hardware. |
+| audited_unpadded_tokenizer_sha256 | `str \| null` | `null` | Fingerprint of an explicitly audited fast tokenizer; see the DPO guide before setting it. |
+| allow_legacy_data_resume | `bool` | `False` | Legacy compatibility field; it cannot bypass required provenance. |
+| allow_legacy_objective_resume | `bool` | `False` | Legacy compatibility field; it cannot bypass the producer-contract checkpoint gate. |
 
 The frozen reference always copies `model`. A custom `reference_model` config is not supported.

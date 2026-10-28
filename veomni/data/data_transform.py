@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 
 import torch
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.dpo_provenance import DPO_FEATURE_KEY, DPOFeatureSegments
+from veomni.utils.dpo_provenance import (
+    DPO_FEATURE_KEY,
+    DPOFeatureSegments,
+    dpo_declared_producer_identity,
+    dpo_tokenizer_fingerprint,
+    packed_batch_digest,
+)
 from veomni.utils.registry import Registry
 
 
@@ -249,6 +256,153 @@ def _dpo_plaintext_completion_start(tokenizer: Any, prompt: str, full_text: str,
     return len(prefix)
 
 
+def dpo_tokenizer_contract_identity(tokenizer: Any, audited_sha256: str | None) -> str:
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.gpt2.tokenization_gpt2 import GPT2Tokenizer
+    from transformers.models.llama.tokenization_llama import LlamaTokenizer
+    from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+
+    if type(tokenizer).__dict__.get("dpo_unpadded_output_contract") is True:
+        return dpo_declared_producer_identity(tokenizer, "tokenizer")
+    if type(tokenizer) in (PreTrainedTokenizerFast, Qwen2Tokenizer, LlamaTokenizer, GPT2Tokenizer):
+        actual = dpo_tokenizer_fingerprint(tokenizer)
+        if type(audited_sha256) is str and actual == audited_sha256:
+            return actual
+    raise ValueError(
+        "DPO tokenizer must declare dpo_unpadded_output_contract=True and a stable contract ID "
+        "or match an audited_unpadded_tokenizer_sha256"
+    )
+
+
+def dpo_producer_identity(tokenizer: Any, chat_template: Any, audited_sha256: str | None) -> dict[str, str | None]:
+    """Validate and identify the actual producers before loading buffered data."""
+    tokenizer_identity = dpo_tokenizer_contract_identity(tokenizer, audited_sha256)
+    template_identity = None
+    template_tokenizer_identity = None
+    if chat_template is not None:
+        template_identity = dpo_declared_producer_identity(chat_template, "chat template")
+        template_tokenizer = getattr(chat_template, "tokenizer", None)
+        if template_tokenizer is not None:
+            template_tokenizer_identity = (
+                tokenizer_identity
+                if template_tokenizer is tokenizer
+                else dpo_tokenizer_contract_identity(template_tokenizer, audited_sha256)
+            )
+    return {
+        "tokenizer": tokenizer_identity,
+        "template": template_identity,
+        "template_tokenizer": template_tokenizer_identity,
+    }
+
+
+def _dpo_completion_only_messages(chosen: list, rejected: list) -> tuple[list, list, list]:
+    if not chosen or not rejected or any(not isinstance(message, dict) for message in chosen + rejected):
+        raise ValueError("DPO conversations require nonempty chosen and rejected message lists")
+
+    def content(message):
+        return {key: value for key, value in message.items() if key != "loss_mask"}
+
+    common = 0
+    while common < min(len(chosen), len(rejected)) and content(chosen[common]) == content(rejected[common]):
+        common += 1
+    if common >= min(len(chosen), len(rejected)):
+        raise ValueError("DPO chosen and rejected conversations require distinct assistant completions")
+    if chosen[common].get("role") != "assistant" or rejected[common].get("role") != "assistant":
+        raise ValueError("DPO chosen and rejected conversations do not share the same prompt history")
+
+    def prepare(messages):
+        result = []
+        for index, message in enumerate(messages):
+            copied = dict(message)
+            if index < common or copied.get("role") != "assistant":
+                copied["loss_mask"] = 0
+            else:
+                copied.setdefault("loss_mask", 1)
+            result.append(copied)
+        return result
+
+    chosen_masked, rejected_masked = prepare(chosen), prepare(rejected)
+    return chosen_masked, rejected_masked, chosen_masked[:common]
+
+
+def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list, max_seq_len: int):
+    if type(max_seq_len) is not int or max_seq_len <= 0:
+        raise ValueError("DPO max_seq_len must be a positive integer")
+    chosen_masked, rejected_masked, prefix = _dpo_completion_only_messages(chosen, rejected)
+
+    def encode(messages, limit):
+        result = chat_template.encode_messages(messages, max_seq_len=limit)
+        return {
+            key: result[key] if isinstance(result[key], torch.Tensor) else torch.tensor(result[key])
+            for key in ("input_ids", "attention_mask", "labels")
+        }
+
+    prefix_ids = encode(prefix, sys.maxsize)["input_ids"] if prefix else torch.empty(0, dtype=torch.int64)
+    prefix_len = prefix_ids.numel()
+    contexts = []
+    outputs = []
+    for original, masked in ((chosen, chosen_masked), (rejected, rejected_masked)):
+        original_with_masks = []
+        for message in original:
+            copied = dict(message)
+            copied.setdefault("loss_mask", 1 if copied.get("role") == "assistant" else 0)
+            original_with_masks.append(copied)
+        raw_ids = encode(original_with_masks, sys.maxsize)["input_ids"]
+        full = encode(masked, sys.maxsize)
+        full_ids = full["input_ids"]
+        truncated = encode(masked, max_seq_len)
+        ids, labels = truncated["input_ids"], truncated["labels"]
+        if (
+            raw_ids.ndim != 1
+            or full_ids.ndim != 1
+            or ids.ndim != 1
+            or labels.shape != ids.shape
+            or full["labels"].shape != full_ids.shape
+        ):
+            raise ValueError("DPO conversation producer must emit flat token and label sequences")
+        if not torch.equal(raw_ids, full_ids):
+            raise ValueError("DPO conversation loss masks must not change tokenization")
+        if prefix_ids.ndim != 1 or prefix_len > full_ids.numel() or not torch.equal(full_ids[:prefix_len], prefix_ids):
+            raise ValueError("DPO conversation template must preserve the shared prompt prefix")
+        for index in range(len(prefix), len(masked)):
+            if masked[index].get("role") == "assistant":
+                continue
+            before = encode(masked[:index], sys.maxsize)["input_ids"]
+            after = encode(masked[: index + 1], sys.maxsize)["input_ids"]
+            if (
+                before.ndim != 1
+                or after.ndim != 1
+                or before.numel() > after.numel()
+                or after.numel() > full_ids.numel()
+                or not torch.equal(full_ids[: before.numel()], before)
+                or not torch.equal(full_ids[: after.numel()], after)
+                or not bool((full["labels"][before.numel() : after.numel()] == IGNORE_INDEX).all())
+            ):
+                raise ValueError("DPO conversation template must mask non-assistant messages")
+        offset = full_ids.numel() - ids.numel()
+        if (
+            offset < 0
+            or offset > prefix_len
+            or ids.numel() > max_seq_len
+            or not torch.equal(full_ids[offset:], ids)
+            or not torch.equal(full["labels"][offset:], labels)
+            or not torch.equal(full["attention_mask"][offset:], truncated["attention_mask"])
+        ):
+            raise ValueError("DPO conversation truncation must preserve the completion and a shared prompt suffix")
+        visible_prefix = prefix_len - offset
+        if prefix_len and not visible_prefix:
+            raise ValueError("DPO conversation truncation removed the entire prompt")
+        if not bool((labels[:visible_prefix] == IGNORE_INDEX).all()):
+            raise ValueError("DPO conversation template must mask the shared prompt history")
+        # Even with no explicit shared history, causal prediction consumes the
+        # first token as context; both branches must condition on the same one.
+        contexts.append(ids[: max(visible_prefix, 1)])
+        outputs.append(truncated)
+    if not torch.equal(contexts[0], contexts[1]):
+        raise ValueError("DPO chosen and rejected contexts differ after truncation")
+    return outputs[0], outputs[1]
+
+
 @DATA_TRANSFORM_REGISTRY.register("dpo")
 def process_dpo_example(
     example: Dict[str, Any],
@@ -256,6 +410,8 @@ def process_dpo_example(
     tokenizer: "PreTrainedTokenizer" = None,
     max_seq_len: int = 2048,
     record_segment_provenance: bool = False,
+    audited_unpadded_tokenizer_sha256: str | None = None,
+    expected_dpo_producer_identity: dict[str, str | None] | None = None,
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
     """Process a DPO preference pair into a single flat sample.
@@ -277,10 +433,35 @@ def process_dpo_example(
     chosen_raw = example["chosen"]
     rejected_raw = example["rejected"]
 
+    if record_segment_provenance:
+        # An all-one mask and physical lengths do not establish that an opaque
+        # producer has not already inserted padding. The producer must declare
+        # the unpadded-output contract; this is an API promise, not an inference
+        # from token values or supervision labels.
+        if expected_dpo_producer_identity is not None:
+            if dpo_producer_identity(tokenizer, chat_template, audited_unpadded_tokenizer_sha256) != (
+                expected_dpo_producer_identity
+            ):
+                raise ValueError("DPO producer identity changed after initialization")
+        elif isinstance(chosen_raw, list):
+            dpo_declared_producer_identity(chat_template, "chat template")
+            template_tokenizer = getattr(chat_template, "tokenizer", None)
+            if template_tokenizer is not None:
+                dpo_tokenizer_contract_identity(template_tokenizer, audited_unpadded_tokenizer_sha256)
+        else:
+            dpo_tokenizer_contract_identity(tokenizer, audited_unpadded_tokenizer_sha256)
+
     if isinstance(chosen_raw, list):
         assert chat_template is not None, "chat_template is required for conversation-format DPO data"
-        chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
-        rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
+        if record_segment_provenance:
+            if not isinstance(rejected_raw, list):
+                raise ValueError("DPO chosen and rejected must use the same conversation format")
+            chosen_tok, rejected_tok = _dpo_conversation_encodings(
+                chat_template, chosen_raw, rejected_raw, max_seq_len
+            )
+        else:
+            chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
+            rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
     else:
         assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"
         prompt = example.get("prompt", "")
@@ -291,6 +472,17 @@ def process_dpo_example(
         rejected_ids = tokenizer.encode(rejected_text, add_special_tokens=True)[:max_seq_len]
         chosen_prompt_len = _dpo_plaintext_completion_start(tokenizer, prompt, chosen_text, chosen_ids)
         rejected_prompt_len = _dpo_plaintext_completion_start(tokenizer, prompt, rejected_text, rejected_ids)
+        if record_segment_provenance:
+            if prompt and (chosen_prompt_len == 0 or rejected_prompt_len == 0):
+                raise ValueError("DPO plaintext completion needs a shared token before the prompt boundary")
+            chosen_context = chosen_ids[: max(chosen_prompt_len, 1)]
+            rejected_context = rejected_ids[: max(rejected_prompt_len, 1)]
+            if (
+                not chosen_context
+                or not rejected_context
+                or not torch.equal(torch.as_tensor(chosen_context), torch.as_tensor(rejected_context))
+            ):
+                raise ValueError("DPO chosen and rejected plaintext contexts differ after tokenization or truncation")
 
         chosen_tok = {
             "input_ids": chosen_ids,
@@ -308,19 +500,36 @@ def process_dpo_example(
 
     c_ids = _to_tensor(chosen_tok["input_ids"])
     r_ids = _to_tensor(rejected_tok["input_ids"])
+    c_labels = _to_tensor(chosen_tok["labels"])
+    r_labels = _to_tensor(rejected_tok["labels"])
     c_len = c_ids.shape[-1]
     r_len = r_ids.shape[-1]
+    if record_segment_provenance:
+        for ids, labels in ((c_ids, c_labels), (r_ids, r_labels)):
+            if ids.shape != labels.shape or not bool(((labels == IGNORE_INDEX) | (labels == ids)).all()):
+                raise ValueError("DPO labels must be unshifted token IDs or IGNORE_INDEX")
+            if not bool((labels != IGNORE_INDEX).any()):
+                raise ValueError("DPO chosen and rejected sequences must each contain supervised tokens")
+            if labels.numel() > 1 and not bool((labels[..., 1:] != IGNORE_INDEX).any()):
+                raise ValueError("DPO multi-token sequences must contain a causal prediction target")
 
     result = {
         "input_ids": torch.cat([c_ids, r_ids]),
         "attention_mask": torch.cat(
             [_to_tensor(chosen_tok["attention_mask"]), _to_tensor(rejected_tok["attention_mask"])]
         ),
-        "labels": torch.cat([_to_tensor(chosen_tok["labels"]), _to_tensor(rejected_tok["labels"])]),
+        "labels": torch.cat([c_labels, r_labels]),
         "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
     }
     if record_segment_provenance:
-        result[DPO_FEATURE_KEY] = DPOFeatureSegments(c_len, r_len)
+        feature_digest = packed_batch_digest(
+            result,
+            feature=True,
+            include_keys=("input_ids", "labels", "position_ids", "attention_mask"),
+        )
+        result[DPO_FEATURE_KEY] = DPOFeatureSegments(
+            c_len, r_len, producer_contract_version=1, feature_digest=feature_digest
+        )
     return [result]
 
 

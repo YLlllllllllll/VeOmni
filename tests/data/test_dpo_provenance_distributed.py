@@ -75,6 +75,7 @@ def _worker(rank, world_size, scenario, endpoint):
             packed_batch_digest(batch, global_only=True),
             layout_sp_size=2 if state.sp_enabled else 1,
             layout_sp_rank=rank % 2 if state.sp_enabled else 0,
+            producer_contract_version=1,
         )
         if scenario in ("source_range", "catalog_mismatch"):
             index = 42 if scenario == "source_range" and rank == 1 else 0
@@ -98,6 +99,8 @@ def _worker(rank, world_size, scenario, endpoint):
             batch.pop(DPO_PROOF_KEY)
         elif scenario == "invalid" and rank == 1:
             batch[DPO_PROOF_KEY] = DPOInvalidProof("injected invalid metadata")
+        elif scenario == "zero_target" and rank == 1:
+            batch[DPO_PROOF_KEY] = replace(batch[DPO_PROOF_KEY], segment_lengths=(1, 3))
         elif (scenario == "microbatch_count" and group_id == 1) or (
             scenario == "dp_only_count_mismatch" and rank == 1
         ):
@@ -176,6 +179,7 @@ def _worker(rank, world_size, scenario, endpoint):
         "missing",
         "mixed_dp",
         "invalid",
+        "zero_target",
         "microbatch_count",
         "one_eof",
         "all_eof",
@@ -220,6 +224,9 @@ def _training_worker(rank, world_size, endpoint):
         data_collator.get_parallel_state = dpo.get_parallel_state = lambda: state
 
         class Tokenizer:
+            dpo_unpadded_output_contract = True
+            dpo_unpadded_output_contract_id = "test-tokenizer-v1"
+
             def encode(self, text, add_special_tokens=True):
                 return list(range(1, len(text) + 1))
 

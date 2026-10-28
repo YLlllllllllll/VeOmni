@@ -21,6 +21,9 @@ from veomni.utils.dpo_provenance import DPO_APPROVED_KEY, DPO_PROOF_KEY, DPOInva
 
 
 class _Tokenizer:
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "test-tokenizer-v1"
+
     def encode(self, text, add_special_tokens=True):
         return [ord(char) for char in text]
 

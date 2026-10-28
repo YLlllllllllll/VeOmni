@@ -71,62 +71,6 @@ def _input_digest(features: list[dict[str, Any]], source_keys: tuple[str, ...]) 
 
 
 @dataclass
-class DPOZeroTailCollator:
-    """Expose the standard collator's known zero tail for otherwise ambiguous DPO segments."""
-
-    collator: MainCollator
-
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        batch = self.collator(features)
-        # The stock packing and SP collators emit tail_padding_length whenever
-        # they append padding. Do not infer zero from a custom pipeline or hook.
-        expected_types = (
-            (PrecomputePositionIDsCollator, PackingCollator, SequenceParallelCollator)
-            if self.collator.channel_loss_sp_size > 1
-            else (PrecomputePositionIDsCollator, PackingCollator)
-        )
-        standard = (
-            type(self.collator) is MainCollator
-            and self.collator.metadata_collate_func is None
-            and not self.collator.seq_classification
-            and tuple(type(item) for item in self.collator.preforward_pipeline) == expected_types
-            and all(
-                self.collator.collate_infos[name] == DEFAULT_DATA_COLLATE_INFO[name]
-                for name in ("input_ids", "labels", "position_ids", "attention_mask")
-            )
-        )
-        if standard:
-            packer = self.collator.preforward_pipeline[1]
-            standard = (
-                packer.collate_infos is self.collator.collate_infos
-                and packer.pad_to_length == self.collator.pad_to_length
-                and not packer.seq_classification
-                and packer.metadata_collate_func is None
-                and packer.sp_enabled == (self.collator.channel_loss_sp_size > 1)
-            )
-        if standard and self.collator.channel_loss_sp_size > 1:
-            slicer = self.collator.preforward_pipeline[2]
-            standard = (
-                slicer.collate_infos is self.collator.collate_infos
-                and not slicer.seq_classification
-                and slicer.metadata_collate_func is None
-                and slicer.sp_size == self.collator.channel_loss_sp_size
-                and slicer.sp_rank == self.collator.channel_loss_sp_rank
-            )
-        cu = batch.get("cu_seq_lens_q")
-        if (
-            standard
-            and "tail_padding_length" not in batch
-            and isinstance(cu, torch.Tensor)
-            and cu.ndim == 1
-            and cu.numel() >= 2
-            and int(cu[-1] - cu[-2]) == 1
-        ):
-            batch["tail_padding_length"] = torch.zeros((), dtype=torch.int32, device=cu.device)
-        return batch
-
-
-@dataclass
 class DPOProvenanceCollator:
     """Carry producer-proven segment lengths without modifying model inputs.
 
@@ -236,6 +180,15 @@ class DPOProvenanceCollator:
                 if (
                     not isinstance(ids, torch.Tensor)
                     or ids.ndim != 1
+                    or type(item.producer_contract_version) is not int
+                    or item.producer_contract_version != 1
+                    or type(item.feature_digest) is not str
+                    or item.feature_digest
+                    != packed_batch_digest(
+                        feature,
+                        feature=True,
+                        include_keys=("input_ids", "labels", "position_ids", "attention_mask"),
+                    )
                     or type(item.chosen) is not int
                     or type(item.rejected) is not int
                     or item.chosen <= 0
@@ -245,10 +198,17 @@ class DPOProvenanceCollator:
                         feature[key].dtype not in (torch.int32, torch.int64)
                         for key in ("input_ids", "labels", "position_ids")
                     )
-                    or any(feature[key].numel() != ids.numel() for key in ("labels", "position_ids", "attention_mask"))
+                    or any(feature[key].shape != ids.shape for key in ("labels", "position_ids", "attention_mask"))
                     or not bool(feature["attention_mask"].eq(1).all())
                     or not bool((feature["input_ids"] >= 0).all())
                     or not bool(((feature["labels"] >= 0) | (feature["labels"] == IGNORE_INDEX)).all())
+                    or not bool(
+                        ((feature["labels"] == IGNORE_INDEX) | (feature["labels"] == feature["input_ids"])).all()
+                    )
+                    or not bool((feature["labels"][: item.chosen] != IGNORE_INDEX).any())
+                    or not bool((feature["labels"][item.chosen :] != IGNORE_INDEX).any())
+                    or (item.chosen > 1 and not bool((feature["labels"][1 : item.chosen] != IGNORE_INDEX).any()))
+                    or (item.rejected > 1 and not bool((feature["labels"][item.chosen + 1 :] != IGNORE_INDEX).any()))
                     or not bool((feature["position_ids"] >= 0).all())
                     or not source_valid
                 ):
@@ -319,5 +279,6 @@ class DPOProvenanceCollator:
             callback_metadata_digests(batch, source_keys),
             self.collator.channel_loss_sp_size,
             self.collator.channel_loss_sp_rank,
+            producer_contract_version=1,
         )
         return batch

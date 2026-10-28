@@ -50,6 +50,12 @@ def _proof_data(value: Any) -> str:
         raise ValueError(f"invalid DPO packed-segment evidence: {value.reason}")
     if not isinstance(value, DPOPackedProof):
         raise ValueError("DPO packed-segment evidence is missing or has an unsupported type")
+    if type(value.producer_contract_version) is not int or value.producer_contract_version != 1:
+        raise ValueError("DPO packed evidence predates the required unpadded producer contract")
+    if isinstance(value.segment_lengths, tuple) and any(
+        type(length) is int and length == 1 for length in value.segment_lengths
+    ):
+        raise ValueError("DPO segments need a causal prediction target; add a BOS token or nonempty context")
     if (
         type(value.segment_lengths) is not tuple
         or not value.segment_lengths
