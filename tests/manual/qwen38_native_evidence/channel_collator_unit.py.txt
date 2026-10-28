@@ -1,0 +1,177 @@
+"""Small packed channel-loss forward/backward gate on a real hybrid SP mesh."""
+import argparse
+import json
+import os
+from datetime import timedelta
+from functools import partial
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from veomni.data.data_collator import CHANNEL_LOSS_PROVENANCE, MainCollator
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.trainer.callbacks.channel_loss_callback import ChannelLossComputer
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("cpu", "npu"), required=True)
+    parser.add_argument("--ulysses", type=int, required=True)
+    parser.add_argument("--cp", type=int, required=True)
+    args = parser.parse_args()
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    assert world == args.ulysses * args.cp
+    if args.backend == "npu":
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(rank)
+        device = torch.device("npu", rank)
+        backend = "hccl"
+    else:
+        device = torch.device("cpu")
+        backend = "gloo"
+    dist.init_process_group(backend, timeout=timedelta(seconds=180))
+    try:
+        state = _init_parallel_state(
+            dp_size=1, ulysses_size=args.ulysses, cp_size=args.cp, allow_hybrid_cp=True,
+            device_type=args.backend, name="channel-unit",
+        )
+        assert state.sp_size == world and state.sp_rank == rank
+        sp_members = set(dist.get_process_group_ranks(state.sp_group))
+        ulysses_members = set(dist.get_process_group_ranks(state.ulysses_group))
+        cp_members = set(dist.get_process_group_ranks(state.cp_group))
+        assert len(sp_members) == world
+        assert len(ulysses_members) == args.ulysses and len(cp_members) == args.cp
+        assert ulysses_members & cp_members == {rank}
+        assert (ulysses_members | cp_members) <= sp_members
+        seq_len, vocab, hidden_size = world * 4, 11, 5
+        cu = [0, 3, 3 + seq_len // 3, seq_len - 3]
+        ids = ["a", "b", "c"]
+        torch.manual_seed(1938)
+        full_hidden = torch.randn(seq_len, hidden_size)
+        full_weight = torch.randn(vocab, hidden_size)
+        targets = torch.randint(0, vocab, (seq_len,))
+        targets[cu[1] - 1] = -100
+        targets[cu[2] - 1] = -100
+        targets[cu[3] - 1:] = -100
+        positions = torch.zeros(seq_len, dtype=torch.long)
+        for start, end in zip(cu, cu[1:]):
+            positions[start:end] = torch.arange(end - start)
+        ref_hidden = full_hidden.clone().requires_grad_()
+        ref_weight = full_weight.clone().requires_grad_()
+        ref_logits = F.linear(ref_hidden, ref_weight)
+        ref_loss = F.cross_entropy(ref_logits, targets, ignore_index=-100)
+        ref_token = F.cross_entropy(ref_logits.detach(), targets, ignore_index=-100, reduction="none")
+        ref_loss.backward()
+        width = seq_len // world
+        start, end = rank * width, (rank + 1) * width
+        raw_labels = torch.full_like(targets, -100)
+        for s, e in zip(cu, cu[1:]):
+            raw_labels[s + 1:e] = targets[s:e - 1]
+        features = [
+            {
+                "input_ids": torch.arange(s, e, dtype=torch.long),
+                "labels": raw_labels[s:e].clone(),
+                "attention_mask": torch.ones(e - s, dtype=torch.long),
+                "ds_idx": source_id,
+            }
+            for (s, e), source_id in zip(zip(cu, cu[1:]), ids)
+        ]
+        op = VeomniOp("cross_entropy_loss", "standard", "eager")
+
+        def execute(enable, batch):
+            local_target = batch["labels"].to(device)
+            hidden = full_hidden[start:end].unsqueeze(0).to(device).detach().requires_grad_()
+            weight = full_weight.to(device).detach().requires_grad_()
+            fn = partial(ForCausalLMLoss, op=op)
+            kwargs = {
+                "labels": local_target, "shift_labels": local_target,
+                "hidden_states": hidden, "weights": weight, "loss_reduction_group": state.sp_group,
+            }
+            if enable:
+                computer = ChannelLossComputer(parallel_state=state)
+                computer._source_ids = ids
+                computer._position_ids = batch["position_ids"].to(device)
+                computer._source_provenance = batch[CHANNEL_LOSS_PROVENANCE]
+                computer._original_loss_fn = fn
+                with computer.capture():
+                    loss, _, _ = computer._wrapped_loss_fn(**kwargs)
+                stats = computer._result
+            else:
+                loss, _, _ = fn(**kwargs)
+                stats = None
+            loss.backward()
+            summed = weight.grad.detach().clone()
+            dist.all_reduce(summed, group=state.sp_group)
+            summed /= world
+            return loss.detach().cpu(), hidden.grad.detach().cpu().squeeze(0) / world, summed.cpu(), stats
+
+        with use_parallel_state(state):
+            batches = []
+            for fixed_padding in (True, False):
+                collator = MainCollator(
+                    pad_to_length=seq_len if fixed_padding else False,
+                    channel_loss_source_id_keys=("ds_idx",),
+                )
+                batch = collator([{k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in item.items()}
+                                  for item in features])
+                provenance = batch[CHANNEL_LOSS_PROVENANCE]
+                assert provenance["source_ids"] == ids and provenance["source_cu"] == cu
+                assert provenance["tail"] == seq_len - cu[-1]
+                assert provenance["sp_size"] == world and provenance["sp_rank"] == rank
+                torch.testing.assert_close(provenance["input_mask"], torch.ones(cu[-1], dtype=torch.bool))
+                expected_ids = torch.cat((torch.arange(cu[-1], dtype=torch.long),
+                                          torch.zeros(seq_len - cu[-1], dtype=torch.long)))
+                torch.testing.assert_close(batch["input_ids"], expected_ids[start:end].unsqueeze(0))
+                torch.testing.assert_close(batch["labels"], targets[start:end].unsqueeze(0))
+                torch.testing.assert_close(batch["position_ids"], positions[start:end].unsqueeze(0))
+                assert batch["attention_mask_is_all_ones"] is True
+                torch.testing.assert_close(batch["attention_mask"], torch.ones((1, seq_len), dtype=torch.long))
+                expected_cu = torch.tensor([*cu, seq_len], dtype=torch.int32)
+                for name in ("cu_seq_lens_q", "cu_seq_lens_k", "linear_attn_cu_seq_lens_q"):
+                    torch.testing.assert_close(batch[name].cpu(), expected_cu, check_dtype=False)
+                assert int(batch["tail_padding_length"].item()) == seq_len - cu[-1]
+                batches.append(batch)
+            baseline = execute(False, batches[0])
+            observed = execute(True, batches[0])
+            automatic_padding = execute(True, batches[1])
+        for expected, actual in zip(observed[:3], automatic_padding[:3]):
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        for expected, actual in zip(baseline[:3], observed[:3]):
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(observed[0], ref_loss.detach(), rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(observed[1], ref_hidden.grad[start:end], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(observed[2], ref_weight.grad, rtol=1e-5, atol=1e-6)
+        for result in (observed, automatic_padding):
+            assert result[3] is not None and len(result[3]) == len(ids)
+            for i, stats in enumerate(result[3]):
+                assert stats["source_id"] == ids[i]
+                assert int(stats["sample_count"].item()) == 1
+                assert int(stats["input_token_count"].item()) == cu[i + 1] - cu[i]
+                mask = targets[cu[i] : cu[i + 1]].ne(-100)
+                expected_count = int(mask.sum())
+                expected_loss_sum = float(ref_token[cu[i] : cu[i + 1]].sum())
+                assert int(stats["token_count"].item()) == expected_count
+                torch.testing.assert_close(
+                    stats["loss_sum"].detach().cpu(), torch.tensor(expected_loss_sum), rtol=1e-5, atol=1e-6
+                )
+        updated = full_weight - 0.001 * observed[2]
+        torch.testing.assert_close(updated, full_weight - 0.001 * ref_weight.grad, rtol=1e-6, atol=1e-6)
+        dist.barrier()
+        if rank == 0:
+            print("COLLATOR_UNIT_PASS " + json.dumps({
+                "world": world, "ulysses": args.ulysses, "cp": args.cp,
+                "source_counts": [int(item["token_count"].item()) for item in observed[3]],
+                "loss": float(observed[0]),
+                "scope": "actual MainCollator packing with fixed/automatic tail, synthetic FP32 eager CE and SGD arithmetic; no model/optimizer",
+            }), flush=True)
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

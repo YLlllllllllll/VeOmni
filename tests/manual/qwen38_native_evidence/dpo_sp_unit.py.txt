@@ -1,0 +1,88 @@
+"""Exercise DPO uneven pair weighting on a real DP × Ulysses × CP mesh."""
+import argparse
+import json
+import os
+from datetime import timedelta
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+
+
+def make_batch(coefficients, sp_size=1, sp_rank=0):
+    # Eight tokens per attention segment leave every SP=8 rank a real shard
+    # while exactly one causal target per segment contributes to the loss.
+    ids, labels = [], []
+    for value in coefficients:
+        for token in (max(value, 0), max(-value, 0)):
+            ids.extend([token] + [0] * 7)
+            labels.extend([-100, 1] + [-100] * 6)
+    ids = torch.tensor([ids], dtype=torch.long)
+    labels = torch.tensor([labels], dtype=torch.long)
+    cu = torch.arange(0, ids.shape[-1] + 1, 8, dtype=torch.int32)
+    if sp_size > 1:
+        labels = F.pad(labels[..., 1:], (0, 1), value=-100)
+        assert ids.shape[-1] % sp_size == 0
+        width = ids.shape[-1] // sp_size
+        ids = ids[:, sp_rank * width : (sp_rank + 1) * width]
+        labels = labels[:, sp_rank * width : (sp_rank + 1) * width]
+    return {"input_ids": ids, "labels": labels, "cu_seq_lens_q": cu}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("cpu", "npu"), required=True)
+    parser.add_argument("--ulysses", type=int, required=True)
+    parser.add_argument("--cp", type=int, required=True)
+    args = parser.parse_args()
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    assert world == 2 * args.ulysses * args.cp
+    if args.backend == "npu":
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(rank)
+        device = f"npu:{rank}"
+        backend = "hccl"
+    else:
+        device, backend = "cpu", "gloo"
+    dist.init_process_group(backend, timeout=timedelta(seconds=180))
+    try:
+        state = _init_parallel_state(
+            dp_size=2, dp_shard_size=2, ulysses_size=args.ulysses, cp_size=args.cp,
+            allow_hybrid_cp=True, dp_mode="ddp", device_type=args.backend, name="dpo-unit",
+        )
+        sp_members = set(dist.get_process_group_ranks(state.sp_group))
+        ulysses_members = set(dist.get_process_group_ranks(state.ulysses_group))
+        cp_members = set(dist.get_process_group_ranks(state.cp_group))
+        dp_members = set(dist.get_process_group_ranks(state.dp_group))
+        assert len(sp_members) == args.ulysses * args.cp and len(dp_members) == 2
+        assert len(ulysses_members) == args.ulysses and len(cp_members) == args.cp
+        assert ulysses_members & cp_members == {rank} and sp_members & dp_members == {rank}
+        assert (ulysses_members | cp_members) <= sp_members
+        import tests.trainer.test_dpo_pair_mean as reference_test
+
+        reference_test._microbatch = make_batch
+        trainer, metrics = reference_test._build_trainer(state, distributed=True, device=device)
+        groups = [[1], [3, 3]] if state.dp_rank == 0 else [[2], [4, 5, 6]]
+        reference_test._run(trainer, groups, state)
+        expected_loss, expected_grad, _ = reference_test._expected([1, 3, 3, 2, 4, 5, 6])
+        torch.testing.assert_close(trainer.policy_model.optimizer.gradient.cpu(), expected_grad, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(torch.tensor(metrics["loss"]), expected_loss, rtol=1e-5, atol=1e-6)
+        assert trainer.policy_model.optimizer.steps == 1
+        dist.barrier()
+        if rank == 0:
+            print("DPO_UNIT_PASS " + json.dumps({
+                "world": world, "dp": 2, "ulysses": args.ulysses, "cp": args.cp,
+                "pair_counts": [1, 2, 1, 3], "loss": float(expected_loss),
+                "gradient": float(expected_grad),
+                "scope": "synthetic scalar DPO/DDP captured gradient; no provenance, EP, or optimizer update",
+            }), flush=True)
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
