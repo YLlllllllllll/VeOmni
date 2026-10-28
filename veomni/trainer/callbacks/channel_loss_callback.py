@@ -3184,21 +3184,6 @@ def _as_str_list(value: Any) -> list[str]:
     return result
 
 
-def _as_scalar_tensor(
-    value: Any,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    name: str,
-) -> torch.Tensor:
-    tensor = torch.as_tensor(value, device=device, dtype=dtype)
-    if tensor.numel() != 1:
-        raise ChannelLossMetadataError(
-            f"Channel loss: local SP {name} must be scalar, got shape={tuple(tensor.shape)}."
-        )
-    return tensor.reshape(())
-
-
 def _source_id_signature(source_ids: list[ChannelKey]) -> tuple[tuple[str, str], ...]:
     return tuple((type(source_id).__name__, repr(source_id)) for source_id in source_ids)
 
