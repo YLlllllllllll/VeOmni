@@ -5,7 +5,11 @@ have multimodal data (images/audio/video) while other ranks have text-only data.
 The model's dummy_forward() must fire on text-only ranks so that all ranks
 participate in FSDP collectives.
 
-Requires: 2+ GPUs.
+Accelerator rejection and standard dummy geometry are owned here. Non-default
+Qwen2.5-VL geometry and CPU/Gloo SP execution are owned by
+tests/models/transformers/qwen/test_qwen2_5_vl.py.
+
+Requires: 2+ GPUs for the FSDP tests; vision contract checks also run on CPU.
 """
 
 import gc
@@ -343,9 +347,16 @@ def test_vlm_dummy_vision_input_construction(family, backend):
 
 
 @pytest.mark.launch_plan(provider=_cpu_vision_plan)
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-@pytest.mark.parametrize("family", ["qwen3_vl", "qwen4_exp"])
-@pytest.mark.parametrize("attention", ["eager", "veomni_sdpa", "veomni_flash_attention_2"])
+@pytest.mark.parametrize(
+    "family,backend,attention",
+    [("qwen2_5_vl", "gpu", attention) for attention in ("eager", "veomni_sdpa")]
+    + [
+        (family, backend, attention)
+        for family in ("qwen3_vl", "qwen4_exp")
+        for backend in ("gpu", "npu")
+        for attention in ("eager", "veomni_sdpa", "veomni_flash_attention_2")
+    ],
+)
 def test_vlm_vision_forward_contract(family, backend, attention):
     """Test actual vision forward separately from dummy input construction."""
     result = subprocess.run(
@@ -355,7 +366,7 @@ def test_vlm_vision_forward_contract(family, backend, attention):
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    expected = 1 if family == "qwen3_vl" and attention != "veomni_flash_attention_2" else 5
+    expected = 1 if family != "qwen4_exp" and attention != "veomni_flash_attention_2" else 5
     assert f"VLM_FORWARD_CASES_OK={expected}" in result.stdout
 
 
@@ -552,18 +563,22 @@ def _check_dummy_vision_inputs(family, backend):
 def _check_vlm_vision_forward(family, backend, attention):
     from transformers import Qwen4ExpConfig
 
-    from tests.models.tiny_configs import tiny_qwen3_vl_config
+    from tests.models.tiny_configs import tiny_qwen2_5_vl_config, tiny_qwen3_vl_config
 
+    model_package = "qwen2_5vl" if family == "qwen2_5_vl" else family
     module = importlib.import_module(
-        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{backend}"
+        f"veomni.models.transformers.{model_package}.generated.patched_modeling_{family}_{backend}"
     )
     # Qwen3-VL's non-FA SP path is not the Qwen4 rejection contract. Cover its
     # regular single-rank path and its FA metadata path without inventing one.
-    sp_sizes = (1,) if family == "qwen3_vl" and attention != "veomni_flash_attention_2" else (1, 2, 8, 16, 32)
+    sp_sizes = (1,) if family != "qwen4_exp" and attention != "veomni_flash_attention_2" else (1, 2, 8, 16, 32)
     for sp_size in sp_sizes:
         with pytest.MonkeyPatch.context() as monkeypatch:
             _install_vision_state(monkeypatch, module, sp_size, 0)
-            if family == "qwen3_vl":
+            if family == "qwen2_5_vl":
+                config = tiny_qwen2_5_vl_config().vision_config
+                vision_cls = module.Qwen2_5_VisionTransformerPretrainedModel
+            elif family == "qwen3_vl":
                 config = tiny_qwen3_vl_config().vision_config
                 vision_cls = module.Qwen3VLVisionModel
             else:
@@ -584,6 +599,10 @@ def _check_vlm_vision_forward(family, backend, attention):
                 "cu_seqlens": torch.tensor([0, global_rows], dtype=torch.int32),
                 "max_seqlen": global_rows,
             }
+            if family == "qwen2_5_vl":
+                metadata = module._qwen2_5_vit_metadata(
+                    [[1, merge, merge]], 0, model.window_size, merge, model.patch_size
+                )
             if attention == "veomni_flash_attention_2":
                 captured = []
 
