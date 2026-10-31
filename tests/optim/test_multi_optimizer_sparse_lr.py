@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.optim.optimizer import MultiOptimizer
 
@@ -181,3 +182,66 @@ def test_sparse_leaf_post_hook_live_reorder_survives_dcp_roundtrip(tmp_path):
     )
     assert restored_leaf.param_groups[0]["lr"] == 0.01
     assert restored_leaf.param_groups[1]["lr"] == 0.02
+
+
+def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        _init_parallel_state(dp_size=2, dp_mode="fsdp2", device_type="cpu")
+        parallel = get_parallel_state()
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+            for layer in model:
+                fully_shard(layer, mesh=parallel.dp_shard_mesh)
+            fully_shard(model, mesh=parallel.dp_shard_mesh)
+            first = torch.optim.AdamW(model[0].parameters(), lr=0.01)
+            second = torch.optim.AdamW(model[1].parameters(), lr=0.01)
+            return model, first, second, MultiOptimizer(model, {"first": first, "second": second}, ["first", "second"])
+
+        model, first, second, optimizer = build(42)
+        scheduler = torch.optim.lr_scheduler.StepLR(second, step_size=1, gamma=0.25)
+        model(torch.ones(2, 4)).sum().backward()
+        for param in model[1].parameters():
+            param.grad = None
+        first.step()
+        first.zero_grad()
+        second.step()
+        scheduler.step()
+        assert second.param_groups[0]["lr"] == 0.0025
+        assert first.state
+        assert not second.state
+        source_shards = [param.to_local().detach().clone() for param in model.parameters()]
+        DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        assert not second.state
+        for expected, param in zip(source_shards, model.parameters(), strict=True):
+            torch.testing.assert_close(expected, param.to_local(), rtol=0, atol=0)
+
+        restored_model, _, restored_second, restored = build(123)
+        assert any(
+            not torch.equal(saved, param.to_local())
+            for saved, param in zip(source_shards, restored_model.parameters(), strict=True)
+        )
+        DistributedCheckpointer.load(
+            checkpoint, {"model": restored_model, "optimizer": restored}, parallel_state=parallel
+        )
+        assert restored_second.param_groups[0]["lr"] == 0.0025
+        for expected, param in zip(source_shards, restored_model.parameters(), strict=True):
+            torch.testing.assert_close(expected, param.to_local(), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_sparse_leaf_learning_rate_survives_two_rank_fsdp2_dcp(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_fsdp2_empty_leaf_worker, args=(str(tmp_path / "ckpt"),), nprocs=2)
