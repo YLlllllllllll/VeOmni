@@ -2,6 +2,11 @@
 
 Opt in with optimizer type `master_fp32_adamw`, `full_fp32_adamw` or `cpu_offload_adamw`. Existing AdamW remains unchanged. Master weights and update arithmetic are FP32; compute weights may remain BF16. BF16 moment storage is lossy and is not equivalent to FP32 moments.
 
+`OptimizerConfig` retains the positional order of the existing optimizer options,
+including learning rate as the second argument. Pass CPU-offload options by
+keyword. The temporary positional form from earlier drafts is rejected rather
+than being interpreted as a learning rate.
+
 In a mixed optimizer, strict checkpoint dtype and shape checks apply to the parameters owned by precision-sensitive optimizer leaves. Unknown saved fields on those parameters require an explicit migration; ordinary AdamW leaves retain their existing loading policy.
 
 Checkpointing parameters that remain owned by a precision-sensitive optimizer

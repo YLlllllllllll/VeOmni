@@ -91,18 +91,6 @@ class OptimizerConfig:
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
-    cpu_offload_param_patterns: List[str] = field(
-        default_factory=list,
-        metadata={"help": "Full parameter-name regexes selecting CPU master/m/v for cpu_offload_adamw."},
-    )
-    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
-        default="float32",
-        metadata={"help": "Moment storage precision for resident cpu_offload_adamw parameters; master stays FP32."},
-    )
-    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
-        default="float32",
-        metadata={"help": "Moment storage precision for CPU-offloaded parameters; master stays FP32."},
-    )
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or default learning rate, or init learning rate for warmup."},
@@ -261,6 +249,23 @@ class OptimizerConfig:
             )
         },
     )
+
+    cpu_offload_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full parameter-name regexes selecting CPU master/m/v for cpu_offload_adamw."},
+    )
+    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32",
+        metadata={"help": "Moment storage precision for resident cpu_offload_adamw parameters; master stays FP32."},
+    )
+    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32",
+        metadata={"help": "Moment storage precision for CPU-offloaded parameters; master stays FP32."},
+    )
+
+    def __post_init__(self):
+        if isinstance(self.lr, (list, tuple)):
+            raise TypeError("Pass CPU-offload options by keyword; the second positional argument is learning rate")
 
 
 @dataclass
