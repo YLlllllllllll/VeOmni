@@ -599,6 +599,102 @@ def _is_standard_scheduler_step(optimizer):
     )
 
 
+def _preflight_single_optimizer_source(model, optimizer, reader_factory, checkpoint_path, group=None):
+    """Check supported optimizer precision transitions before model loading."""
+    metadata, error = None, None
+    save_id, legacy_metadata = None, None
+    try:
+        from ..optim.master_fp32_adamw import MasterFP32AdamW
+
+        if type(optimizer) is torch.optim.AdamW or isinstance(optimizer, MasterFP32AdamW):
+            metadata = reader_factory(checkpoint_path).read_metadata()
+            keys = metadata.state_dict_metadata
+            if type(optimizer) is torch.optim.AdamW:
+                has_master = any(key.startswith("optimizer.state.") and key.endswith(".master_weight") for key in keys)
+                if has_master:
+                    raise RuntimeError(
+                        "FP32-master optimizer checkpoint cannot be restored into ordinary AdamW; "
+                        "restore with a compatible optimizer or explicitly migrate its state"
+                    )
+            else:
+                owned = {id(param) for param_group in optimizer.param_groups for param in param_group["params"]}
+                names = _dcp_parameter_name_map(model)
+                owned_names = {name for name, param in names.items() if id(param) in owned}
+                saved_by_name = {}
+                for key in keys:
+                    if not key.startswith("optimizer.state."):
+                        continue
+                    state_key = key.removeprefix("optimizer.state.")
+                    name, sep, _ = state_key.rpartition(".")
+                    while sep:
+                        if name in owned_names:
+                            saved_by_name.setdefault(name, set()).add(state_key[len(name) + 1 :])
+                            break
+                        name, sep, _ = name.rpartition(".")
+                    else:
+                        raise RuntimeError(
+                            f"DCP optimizer state {key} does not match a target optimizer parameter; "
+                            "restore the original parameter layout or explicitly migrate optimizer state"
+                        )
+                if not any(key.startswith("optimizer.state.") for key in keys) and (
+                    f"optimizer.{_ZERO_OPTIMIZER_STATE_MARKER}" not in keys
+                ):
+                    raise RuntimeError(
+                        "DCP is missing every precision-sensitive optimizer state entry; "
+                        "explicit checkpoint migration is required"
+                    )
+                for name, param in names.items():
+                    if id(param) not in owned:
+                        continue
+                    prefix = f"optimizer.state.{name}."
+                    saved = saved_by_name.get(name, set())
+                    if saved and not {"step", "master_weight", "exp_avg", "exp_avg_sq"}.issubset(saved):
+                        raise RuntimeError(
+                            f"DCP is missing part of precision-sensitive optimizer state for {prefix}; "
+                            "explicit checkpoint migration is required"
+                        )
+                    unsupported = saved.difference({"step", "master_weight", "exp_avg", "exp_avg_sq"})
+                    if unsupported:
+                        raise RuntimeError(
+                            f"DCP contains unsupported precision-sensitive optimizer state fields {sorted(unsupported)} "
+                            f"for {prefix}; explicit migration is required"
+                        )
+                    for field in ("master_weight", "exp_avg", "exp_avg_sq"):
+                        if field not in saved:
+                            continue
+                        source_dtype = getattr(getattr(keys[prefix + field], "properties", None), "dtype", None)
+                        dtype_fn = getattr(optimizer, "_state_dtype", None)
+                        if dtype_fn:
+                            target_dtype = dtype_fn(param, field)
+                        else:
+                            target_dtype = torch.float32 if field == "master_weight" else optimizer.moment_dtype
+                        if source_dtype != target_dtype:
+                            raise RuntimeError(
+                                f"DCP optimizer dtype mismatch for {prefix + field}: "
+                                f"saved={source_dtype}, configured={target_dtype}; explicit precision migration is required"
+                            )
+                        source_shape = getattr(keys[prefix + field], "size", None)
+                        if not isinstance(param, DTensor) and source_shape != param.shape:
+                            raise RuntimeError(
+                                f"DCP optimizer shape mismatch for {prefix + field}: "
+                                f"saved={source_shape}, configured={param.shape}; explicit shape migration is required"
+                            )
+        save_id = getattr(getattr(metadata, "storage_meta", None), "save_id", None)
+        if save_id == "":
+            save_id = None
+        # Older DCP metadata has no generation ID. Comparing its optimizer
+        # schema again prevents a changed layout bypassing this preflight; it
+        # does not make a mutable checkpoint an atomic snapshot.
+        if metadata is not None and save_id is None:
+            legacy_metadata = {
+                key: value for key, value in metadata.state_dict_metadata.items() if key.startswith("optimizer.")
+            }
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating source optimizer precision", group=group)
+    return save_id, legacy_metadata
+
+
 def _preflight_cpu_offload_groups(model, optimizer, reader_factory, checkpoint_path, group=None, policy_checked=False):
     """Check saved group FQNs before DCP can write model/optimizer tensors.
 
@@ -868,6 +964,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         optimizer=None,
         model=None,
         expected_optimizer_save_id=None,
+        expected_optimizer_legacy_metadata=None,
     ):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
@@ -876,6 +973,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.optimizer = optimizer
         self.model = model
         self.expected_optimizer_save_id = expected_optimizer_save_id
+        self.expected_optimizer_legacy_metadata = expected_optimizer_legacy_metadata
 
     def create_local_plan(self):
         # The marker is an ephemeral handoff from planning to load_state_dict.
@@ -888,6 +986,10 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             actual_id = getattr(getattr(self.metadata, "storage_meta", None), "save_id", None)
             if actual_id != self.expected_optimizer_save_id:
                 raise RuntimeError("Optimizer checkpoint changed after group preflight")
+        if self.expected_optimizer_legacy_metadata is not None:
+            actual = {key: value for key, value in metadata.items() if key.startswith("optimizer.")}
+            if actual != self.expected_optimizer_legacy_metadata:
+                raise RuntimeError("Legacy optimizer checkpoint schema changed after precision preflight")
         for key, path in self.mappings.items():
             if path and path[-1] == _EXTRA_PARALLEL_LAYOUT_MARKER and key not in metadata:
                 raise RuntimeError(
@@ -2435,6 +2537,15 @@ class DistributedCheckpointer(CheckpointerBase):
 
         _validate_frozen_targets()
         fused_dir = cls._legacy_fused_dir(path, module)
+        optimizer_path = fused_dir if fused_dir is not None else optimizer_dir(path, module)
+        source_identity = (
+            _preflight_single_optimizer_source(
+                state["model"], optimizer, cls._create_storage_reader, optimizer_path, group=process_group
+            )
+            if wants_optimizer
+            else None
+        )
+        source_save_id, source_legacy_metadata = source_identity or (None, None)
         if fused_dir is not None and not exact:
             load_state: Dict[str, Any] = {"model": _model_state()}
             if wants_optimizer:
@@ -2450,6 +2561,8 @@ class DistributedCheckpointer(CheckpointerBase):
                         strict_optimizer_recipe=_requires_exact_optimizer_recipe(optimizer),
                         optimizer=optimizer,
                         model=state["model"],
+                        expected_optimizer_save_id=source_save_id,
+                        expected_optimizer_legacy_metadata=source_legacy_metadata,
                     ),
                 )
             finally:
@@ -2458,7 +2571,6 @@ class DistributedCheckpointer(CheckpointerBase):
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
             return state
-        optimizer_path = fused_dir if fused_dir is not None else optimizer_dir(path, module)
         optimizer_save_id = None
         if wants_optimizer:
             optimizer_save_id = _preflight_cpu_offload_groups(
@@ -2492,7 +2604,10 @@ class DistributedCheckpointer(CheckpointerBase):
                     strict_optimizer_recipe=_requires_exact_optimizer_recipe(optimizer),
                     optimizer=optimizer,
                     model=state["model"],
-                    expected_optimizer_save_id=optimizer_save_id if fused_dir is not None else None,
+                    expected_optimizer_save_id=(source_save_id or optimizer_save_id)
+                    if fused_dir is not None
+                    else None,
+                    expected_optimizer_legacy_metadata=source_legacy_metadata if fused_dir is not None else None,
                 ),
             )
         finally:
@@ -2538,8 +2653,9 @@ class DistributedCheckpointer(CheckpointerBase):
                         strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                         strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
                         optimizer=state.get("optimizer"),
+                        expected_optimizer_save_id=source_save_id or optimizer_save_id,
+                        expected_optimizer_legacy_metadata=source_legacy_metadata,
                         model=state["model"],
-                        expected_optimizer_save_id=optimizer_save_id,
                     ),
                 )
             finally:

@@ -9,6 +9,27 @@ than being interpreted as a learning rate.
 
 In a mixed optimizer, strict checkpoint dtype and shape checks apply to the parameters owned by precision-sensitive optimizer leaves. Unknown saved fields on those parameters require an explicit migration; ordinary AdamW leaves retain their existing loading policy.
 
+For supported single optimizers, the framework checks saved optimizer fields and
+moment dtypes before loading model tensors. A recognized FP32-master checkpoint
+cannot be restored as ordinary `torch.optim.AdamW`, and an initialized ordinary
+AdamW checkpoint cannot be restored as an FP32-master optimizer without explicit
+migration. For intentional fresh-optimizer training, load model weights without
+an optimizer. These checks do not identify every historical encoding and do not
+establish source-type compatibility for mixed optimizers.
+
+Legacy checkpoints may lack an optimizer type marker. For these checkpoints,
+ordinary AdamW state with a custom `master_weight` field is rejected because it
+is indistinguishable from FP32-master state; explicit migration is required.
+Restoring a precision-sensitive optimizer also rejects saved state for parameters
+the target optimizer no longer owns, including a parameter newly removed when
+freezing. Parameter-group and scheduler changes require explicit migration.
+The step tensor is checked by the DCP planner, which can run after model loading.
+
+Never overwrite a checkpoint directory while a restore is reading it. New DCP
+save identifiers detect changed generations; for older metadata without an ID,
+the loader compares optimizer schemas again during planning, but identical schemas
+do not prove that model and optimizer shards came from the same generation.
+
 Checkpointing parameters that remain owned by a precision-sensitive optimizer
 while frozen, followed by unfreezing, is not yet supported safely. The save
 rejects frozen parameters with existing optimizer history rather than silently

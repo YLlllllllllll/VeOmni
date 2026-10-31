@@ -1,5 +1,8 @@
 """CPU/Gloo coverage for pre-read validation of offload optimizer groups."""
 
+import pickle
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,9 +19,11 @@ from veomni.checkpoint.dcp_checkpointer import (
     _coordinated_optimizer_policy,
     _ModelStrictLoadPlanner,
     _preflight_cpu_offload_groups,
+    _preflight_single_optimizer_source,
 )
 from veomni.checkpoint.layout import optimizer_dir, weights_dir
 from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
+from veomni.optim.master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -57,6 +62,293 @@ def _clone_state(model, optimizer):
         [param.detach().clone() for param in model.parameters()],
         [{key: value.clone() for key, value in optimizer.state[param].items()} for param in model.parameters()],
     )
+
+
+def _plain_adamw_source_preflight_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+
+        class Reader:
+            def read_metadata(self):
+                fields = {"optimizer.state.weight.master_weight": object()} if rank == 0 else {}
+                return SimpleNamespace(state_dict_metadata=fields)
+
+        with pytest.raises(RuntimeError, match="FP32-master|validating source optimizer precision"):
+            _preflight_single_optimizer_source(None, optimizer, lambda _: Reader(), "/unused")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_plain_adamw_source_rejection_is_coordinated():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_plain_adamw_source_preflight_worker, args=(), nprocs=2)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("save_id", [None, ""])
+def test_legacy_optimizer_without_save_id_restores_when_unchanged(tmp_path, fused, save_id):
+    source_model, source = _model_and_optimizer()
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    checkpoint = tmp_path if fused else Path(optimizer_dir(str(tmp_path)))
+    metadata_path = checkpoint / ".metadata"
+    with metadata_path.open("rb") as stream:
+        metadata = pickle.load(stream)
+    metadata.storage_meta.save_id = save_id
+    with metadata_path.open("wb") as stream:
+        pickle.dump(metadata, stream)
+
+    target_model, target = _model_and_optimizer()
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    for source_param, target_param in zip(source_model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(source_param, target_param, rtol=0, atol=0)
+        for key, source_value in source.state[source_param].items():
+            torch.testing.assert_close(source_value, target.state[target_param][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("save_id", [None, ""])
+def test_legacy_optimizer_schema_change_cannot_bypass_precision_preflight(tmp_path, monkeypatch, fused, save_id):
+    from veomni.checkpoint import dcp_checkpointer
+
+    def clear_save_id(path):
+        metadata_path = Path(path) / ".metadata"
+        with metadata_path.open("rb") as stream:
+            metadata = pickle.load(stream)
+        metadata.storage_meta.save_id = save_id
+        with metadata_path.open("wb") as stream:
+            pickle.dump(metadata, stream)
+
+    source = tmp_path / "ordinary"
+    replacement = tmp_path / "master"
+    source_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.01)
+    _step(source_model, source_optimizer, 1.0)
+    _save(source, source_model, source_optimizer, fused)
+    replacement_model, replacement_optimizer = _model_and_optimizer()
+    replacement_model.to(dtype=torch.bfloat16)
+    _step(replacement_model, replacement_optimizer, 1.0)
+    _save(replacement, replacement_model, replacement_optimizer, fused)
+    source_checkpoint = source if fused else Path(optimizer_dir(str(source)))
+    replacement_checkpoint = replacement if fused else Path(optimizer_dir(str(replacement)))
+    clear_save_id(source_checkpoint)
+    clear_save_id(replacement_checkpoint)
+
+    original_preflight = dcp_checkpointer._preflight_single_optimizer_source
+
+    def replace_after_preflight(*args, **kwargs):
+        identity = original_preflight(*args, **kwargs)
+        shutil.rmtree(source_checkpoint)
+        shutil.copytree(replacement_checkpoint, source_checkpoint)
+        return identity
+
+    monkeypatch.setattr(dcp_checkpointer, "_preflight_single_optimizer_source", replace_after_preflight)
+    target_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+    with pytest.raises(CheckpointException, match="schema changed after precision preflight"):
+        DistributedCheckpointer.load(
+            str(source),
+            {"model": target_model, "optimizer": target_optimizer},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+        )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_plain_adamw_rejects_fp32_master_checkpoint_before_model_load(tmp_path, fused):
+    source_model, source = _model_and_optimizer()
+    source_model.to(dtype=torch.bfloat16)
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+
+    target_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    target = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+    before = [param.detach().clone() for param in target_model.parameters()]
+    with pytest.raises(RuntimeError, match="FP32-master optimizer checkpoint cannot be restored"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    for saved, param in zip(before, target_model.parameters(), strict=True):
+        torch.testing.assert_close(saved, param, rtol=0, atol=0)
+    assert not target.state
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_fp32_master_checkpoint_allows_explicit_weights_only_load(tmp_path, fused):
+    source_model, source = _model_and_optimizer()
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3)
+    DistributedCheckpointer.load(str(tmp_path), {"model": target_model}, parallel_state=SimpleNamespace(dp_mode="ddp"))
+    for expected, actual in zip(source_model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_plain_adamw_checkpoint_resume_keeps_same_update(tmp_path, fused):
+    source_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    source = torch.optim.AdamW(source_model.parameters(), lr=0.01)
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    target = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    _step(source_model, source, 0.5)
+    _step(target_model, target, 0.5)
+    for expected, actual in zip(source_model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("target_cls", [CPUOffloadAdamW, FullFP32AdamW, MasterFP32AdamW])
+def test_fp32_optimizer_rejects_plain_adamw_state_before_model_load(tmp_path, fused, dtype, target_cls):
+    source_model = torch.nn.Linear(4, 3).to(dtype=dtype)
+    source = torch.optim.AdamW(source_model.parameters(), lr=0.01)
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3).to(dtype=dtype)
+    target = target_cls(target_model.parameters(), lr=0.01)
+    before = [param.detach().clone() for param in target_model.parameters()]
+    with pytest.raises(RuntimeError, match="missing part of precision-sensitive optimizer state"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    for saved, param in zip(before, target_model.parameters(), strict=True):
+        torch.testing.assert_close(saved, param, rtol=0, atol=0)
+    assert not target.state
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_offload_optimizer_rejects_moment_dtype_change_before_model_load(tmp_path, fused):
+    source_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    source = CPUOffloadAdamW(source_model.parameters(), lr=0.01, resident_moment_dtype=torch.bfloat16)
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    target = CPUOffloadAdamW(target_model.parameters(), lr=0.01, resident_moment_dtype=torch.float32)
+    before = [param.detach().clone() for param in target_model.parameters()]
+    with pytest.raises(RuntimeError, match="optimizer dtype mismatch"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    for saved, param in zip(before, target_model.parameters(), strict=True):
+        torch.testing.assert_close(saved, param, rtol=0, atol=0)
+    assert not target.state
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_full_fp32_checkpoint_rejects_bf16_moments_before_model_load(tmp_path, fused):
+    source_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    source = FullFP32AdamW(source_model.parameters(), lr=0.01)
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    target = MasterFP32AdamW(target_model.parameters(), lr=0.01)
+    before = [param.detach().clone() for param in target_model.parameters()]
+    with pytest.raises(RuntimeError, match="optimizer dtype mismatch"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    for saved, param in zip(before, target_model.parameters(), strict=True):
+        torch.testing.assert_close(saved, param, rtol=0, atol=0)
+    assert not target.state
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("source_kind,target_kind", [("master", "master"), ("master", "cpu"), ("cpu", "master")])
+def test_master_bf16_moments_resume_without_dtype_change(tmp_path, fused, source_kind, target_kind):
+    def build(kind, model):
+        if kind == "master":
+            return MasterFP32AdamW(model.parameters(), lr=0.01)
+        return CPUOffloadAdamW(model.parameters(), lr=0.01, resident_moment_dtype=torch.bfloat16)
+
+    source_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    source = build(source_kind, source_model)
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3).to(dtype=torch.bfloat16)
+    target = build(target_kind, target_model)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    _step(source_model, source, 0.5)
+    _step(target_model, target, 0.5)
+    for expected, actual in zip(source_model.parameters(), target_model.parameters(), strict=True):
+        assert target.state[actual]["exp_avg"].dtype == torch.bfloat16
+        if source_kind == target_kind:
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_plain_adamw_zero_state_with_custom_chunk_size_still_loads(tmp_path, fused):
+    source_model = torch.nn.Linear(4, 3)
+    source = torch.optim.AdamW([{"params": source_model.parameters(), "chunk_size": 4}], lr=0.01)
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    _save(tmp_path, source_model, source, fused)
+    target_model = torch.nn.Linear(4, 3)
+    target = torch.optim.AdamW([{"params": target_model.parameters(), "chunk_size": 4}], lr=0.01)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("defect", ["extra", "nested", "shape"])
+def test_fp32_optimizer_rejects_invalid_fields_before_model_load(tmp_path, fused, defect):
+    source_model, source = _model_and_optimizer()
+    _step(source_model, source, 1.0)
+    if defect == "extra":
+        source.state[source_model.weight]["extra_stat"] = torch.ones(1)
+        expected_error = "unsupported precision-sensitive optimizer state fields"
+    elif defect == "nested":
+        source.state[source_model.weight]["custom"] = {"nested": torch.ones(1)}
+        expected_error = "unsupported precision-sensitive optimizer state fields"
+    else:
+        source.state[source_model.weight]["exp_avg"] = torch.ones(1)
+        expected_error = "optimizer shape mismatch"
+    _save(tmp_path, source_model, source, fused)
+    target_model, target = _model_and_optimizer()
+    before = [param.detach().clone() for param in target_model.parameters()]
+    with pytest.raises(RuntimeError, match=expected_error):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    for saved, param in zip(before, target_model.parameters(), strict=True):
+        torch.testing.assert_close(saved, param, rtol=0, atol=0)
+    assert not target.state
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_fp32_optimizer_rejects_changed_tied_parameter_name_before_model_load(tmp_path, fused):
+    def build(first):
+        model = torch.nn.Module()
+        shared = torch.nn.Parameter(torch.randn(3))
+        model.register_parameter(first, shared)
+        model.register_parameter("right" if first == "left" else "left", shared)
+        return model, FullFP32AdamW(model.parameters(), lr=0.01)
+
+    source_model, source = build("left")
+    _step(source_model, source, 1.0)
+    _save(tmp_path, source_model, source, fused)
+    target_model, target = build("right")
+    before = target_model.right.detach().clone()
+    with pytest.raises(RuntimeError, match="does not match a target optimizer parameter"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    torch.testing.assert_close(before, target_model.right, rtol=0, atol=0)
+    assert not target.state
 
 
 @pytest.mark.parametrize("fused", [False, True])
