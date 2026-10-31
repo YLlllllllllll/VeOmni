@@ -352,6 +352,96 @@ def _epoch_test_collate(items):
     return items[0]
 
 
+def test_trainer_rejects_dynamic_epoch_boundary_before_restoring_cursor(monkeypatch):
+    from types import SimpleNamespace
+
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    loader = _loader()
+    restored = []
+    monkeypatch.setattr(loader, "load_state_dict", lambda state: restored.append(state))
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(global_rank=0, checkpoint=SimpleNamespace(load_path="/unused")), train_steps=6
+        ),
+        state=SimpleNamespace(global_step=0, epoch=0),
+        train_dataloader=loader,
+    )
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {"global_step": 18, "train_dataloader": {}}
+
+    with pytest.raises(RuntimeError, match="Cannot safely restore.*epoch boundary"):
+        callback.load_global_state()
+    assert trainer.state.global_step == 0
+    assert restored == []
+
+
+@pytest.mark.parametrize("cursor_field", [{}, {"train_dataloader": None}])
+def test_trainer_allows_new_data_without_cursor_at_epoch_boundary(monkeypatch, cursor_field):
+    from types import SimpleNamespace
+
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(global_rank=0, checkpoint=SimpleNamespace(load_path="/unused")), train_steps=6
+        ),
+        state=SimpleNamespace(global_step=0, epoch=0),
+        train_dataloader=_loader(),
+        channel_loss_callback=None,
+        offline_cache_writer=None,
+        environ_meter=None,
+    )
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {"global_step": 18, **cursor_field}
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.set_device_rng_state", lambda _: None)
+
+    callback.load_global_state()
+    assert trainer.state.global_step == 18
+    assert trainer.start_epoch == 3
+    assert trainer.start_step == 0
+
+
+def _epoch_boundary_guard_worker(rank, endpoint):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        loader = _loader()
+        restored = []
+        loader.load_state_dict = lambda state: restored.append(state)
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(
+                train=SimpleNamespace(global_rank=rank, checkpoint=SimpleNamespace(load_path="/unused")), train_steps=6
+            ),
+            state=SimpleNamespace(global_step=0, epoch=0),
+            train_dataloader=loader,
+        )
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback._read_current = lambda _: {"global_step": 18 if rank == 0 else 17, "train_dataloader": {}}
+        with pytest.raises(RuntimeError, match="epoch boundary|failed on another rank"):
+            callback.load_global_state()
+        assert trainer.state.global_step == 0
+        assert restored == []
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_epoch_boundary_guard_propagates_before_any_rank_restores():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_epoch_boundary_guard_worker, args=(), nprocs=2)
+
+
 @pytest.mark.parametrize("workers", [0, 2])
 def test_native_sft_mid_epoch_resume_restores_sampler_before_worker_prefetch(monkeypatch, workers):
     from types import SimpleNamespace

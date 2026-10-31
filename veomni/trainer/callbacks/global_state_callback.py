@@ -289,8 +289,23 @@ class GlobalStateCallback(Callback):
         try:
             cursor = global_state.get("train_dataloader")
             global_step = global_state["global_step"]
+            from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+            loader = self.trainer.train_dataloader
+            if (
+                type(loader) is DynamicBatchSizeDataLoader
+                and cursor is not None
+                and global_step > 0
+                and args.train_steps > 0
+                and global_step % args.train_steps == 0
+            ):
+                raise RuntimeError(
+                    "Cannot safely restore main-process dynamic batching at an epoch boundary: "
+                    "the saved cursor cannot prove the next epoch's buffered samples and source position. "
+                    "Resume from a verified mid-epoch checkpoint or use a loader with verified epoch-boundary resume."
+                )
             if isinstance(cursor, dict) and "_veomni_source_exhausted" in cursor:
-                from ...data.dynamic_batching import DynamicBatchSizeDataLoader, _check_legacy_exhausted_cursor
+                from ...data.dynamic_batching import _check_legacy_exhausted_cursor
 
                 if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
                     _check_legacy_exhausted_cursor(cursor)

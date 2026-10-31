@@ -50,8 +50,15 @@ a batch was yielded. Older cursors lack that phase and may resume with a
 different next batch; exact continuation from them requires an independently
 verified migration. Older code also cannot reliably resume a cursor written by
 this version. Worker-mode dynamic batching uses a separate cursor path.
-Restoring shuffled multi-worker inputs at a nonzero epoch and restoring across
-epoch boundaries are not yet guaranteed to reproduce the original samples.
+Restoring shuffled multi-worker inputs at a nonzero epoch is not generally
+guaranteed to reproduce the original samples. For main-process dynamic batching,
+trainer restore rejects an epoch boundary detected from the current epoch length:
+old cursors do not prove how to combine buffered samples with the next source
+epoch. Old checkpoints do not record the original epoch length, so changing that
+length can evade this guard. Use an independently verified mid-epoch checkpoint
+with unchanged data and training geometry until there is a versioned contract.
+Worker-mode and custom loader epoch-boundary behavior are not established by this
+guard. Dropping the dataloader cursor to train on new data remains supported.
 Exhausted one-shot sources cannot be drained independently by each rank as a
 distributed continuation; use a restartable source or coordinated exhaustion.
 For safety, cursors written by the prior exhausted-source experiment with its
