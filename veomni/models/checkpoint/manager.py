@@ -224,6 +224,8 @@ class ModelCheckpointManager:
         self._last_legacy_export_dcp_step = None
         self._last_saved_optimizer_ref = None
         self._loaded_optimizer_ref = None
+        self._loaded_checkpoint_path = None
+        self._loaded_checkpointer = None
         self._last_saved_without_optimizer = False
         self._last_export_validated_step = None
         self._last_export_released_optimizer = False
@@ -363,6 +365,8 @@ class ModelCheckpointManager:
         self._loaded_optimizer_ref = None
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
+        self._loaded_checkpoint_path = None
+        self._loaded_checkpointer = None
         load_dir, error = None, None
         try:
             load_dir = self.load_dir()
@@ -377,9 +381,10 @@ class ModelCheckpointManager:
         if load_dir is None:
             return
 
-        optimizer, state, kwargs, error = None, None, None, None
+        optimizer, checkpointer, state, kwargs, error = None, None, None, None, None
         try:
             optimizer = self.runtime.optimizer
+            checkpointer = self.checkpointer
             state = {
                 "model": self.runtime.model,
                 "optimizer": optimizer,
@@ -392,18 +397,22 @@ class ModelCheckpointManager:
         raise_if_any_rank_failed(error, "preparing checkpoint load arguments")
         multi = _agree_multi_optimizer_mode(optimizer)
 
+        def abort_file_backed_state():
+            leaves = getattr(optimizer, "optimizers_dict", {})
+            targets = [optimizer, *(leaves.values() if isinstance(leaves, dict) else ())]
+            for leaf in targets:
+                abort = getattr(leaf, "checkpoint_abort_file_backed_state", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        pass  # Preserve the original restore error.
+
         def check_restore_error(error, description):
             try:
                 raise_if_any_rank_failed(error, description)
             except BaseException:
-                leaves = getattr(optimizer, "optimizers_dict", {})
-                for leaf in leaves.values() if isinstance(leaves, dict) else ():
-                    abort = getattr(leaf, "checkpoint_abort_file_backed_state", None)
-                    if callable(abort):
-                        try:
-                            abort()
-                        except Exception:
-                            pass  # Preserve the original coordinated restore error.
+                abort_file_backed_state()
                 raise
 
         error = None
@@ -414,7 +423,7 @@ class ModelCheckpointManager:
         check_restore_error(error, "waiting before checkpoint load")
         error = None
         try:
-            self.checkpointer.load(load_dir, state, **kwargs)
+            checkpointer.load(load_dir, state, **kwargs)
         except BaseException as exc:
             error = exc
         check_restore_error(error, "loading distributed checkpoint")
@@ -454,9 +463,16 @@ class ModelCheckpointManager:
             self._load_extra_state(state["extra_state"])
             if self.runtime.optimizer is not optimizer:
                 raise RuntimeError("Optimizer changed while restoring the checkpoint")
+            if self.checkpointer is not checkpointer:
+                raise RuntimeError("Checkpoint provider changed while restoring the checkpoint")
         except BaseException as exc:
             error = exc
         check_restore_error(error, "restoring checkpoint state and optimizer identity")
+        try:
+            dist.barrier()
+        except BaseException:
+            abort_file_backed_state()
+            raise
         if multi:
             self._loaded_optimizer_global_step = step
             self._loaded_optimizer_generation = generation
@@ -465,7 +481,8 @@ class ModelCheckpointManager:
                 self._loaded_optimizer_ref = weakref.ref(optimizer)
             except TypeError:
                 self._loaded_optimizer_ref = None
-        dist.barrier()
+        self._loaded_checkpoint_path = load_dir
+        self._loaded_checkpointer = checkpointer
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
@@ -667,6 +684,32 @@ class ModelCheckpointManager:
         self._last_saved_optimizer_generation = generation
         self._last_legacy_export_dcp_step = None
         self._last_export_validated_step = None
+        self._last_export_released_optimizer = False
+
+    def confirm_legacy_loaded_checkpoint_for_reuse(self, step: int, load_path: str) -> None:
+        """Bind a legacy DCP only after its optimizer and trainer cursor restore."""
+        from ...checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        optimizer = self.runtime.optimizer
+        if (
+            type(step) is not int
+            or step < 0
+            or optimizer is None
+            or getattr(optimizer, "_is_multi_optimizer", False) is not False
+            or self._loaded_optimizer_ref is None
+            or self._loaded_optimizer_ref() is not optimizer
+            or self._loaded_checkpoint_path is None
+            or not layout.same_checkpoint_path(self._loaded_checkpoint_path, load_path)
+            or self._loaded_checkpointer is not DistributedCheckpointer
+            or self.checkpointer is not self._loaded_checkpointer
+            or getattr(self.checkpointer, "_async_save_failed", False) is True
+        ):
+            raise RuntimeError("Cannot reuse an unproven legacy optimizer checkpoint receipt")
+        self._last_saved_step = step
+        self._last_saved_optimizer_ref = self._loaded_optimizer_ref
+        self._last_saved_without_optimizer = False
+        self._last_legacy_export_dcp_step = step
+        self._last_export_validated_step = step
         self._last_export_released_optimizer = False
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
