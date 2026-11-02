@@ -24,7 +24,9 @@ def _optimizer_kind_mismatch_worker(rank, root):
         optimizer = MultiOptimizer(source, {"leaf": leaf}, ["leaf"])
         parallel = SimpleNamespace(dp_mode="ddp")
         path = f"{root}/checkpoint"
-        DistributedCheckpointer.save(path, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            path, {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+        )
 
         target = torch.nn.Linear(2, 2)
         with torch.no_grad():
@@ -34,7 +36,9 @@ def _optimizer_kind_mismatch_worker(rank, root):
         target_optimizer = MultiOptimizer(target, {"leaf": target_leaf}, ["leaf"]) if rank == 0 else target_leaf
         with pytest.raises(RuntimeError, match="Checkpoint load format differs across ranks"):
             DistributedCheckpointer.load(
-                path, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel
+                path,
+                {"model": target, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
         torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
         completed = torch.tensor(1)

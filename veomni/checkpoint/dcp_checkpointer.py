@@ -144,6 +144,13 @@ class _PreparedLoadState:
 
 
 _EXPERT_LAYOUTS_KEY = "__veomni_expert_layouts__"
+_LEGACY_VEOMNI_TP1_EP0_FSDP1 = "veomni_tp1_ep0_fsdp1"
+_LEGACY_VEOMNI_TP1_NO_EP = "veomni_tp1_no_ep"
+
+
+def _validate_legacy_expert_source_layout(value):
+    if value is not None and value not in (_LEGACY_VEOMNI_TP1_EP0_FSDP1, _LEGACY_VEOMNI_TP1_NO_EP):
+        raise ValueError(f"Unsupported legacy expert source layout: {value!r}")
 
 
 def _expert_layout(tensor):
@@ -217,11 +224,22 @@ class _FileBackedSavePlanner(_ExtraParallelSavePlanner):
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
-    def __init__(self, strict_model: bool, expected_save_id=None, strict_gdn_fp32: bool = False):
+    def __init__(
+        self,
+        strict_model: bool,
+        expected_save_id=None,
+        strict_gdn_fp32: bool = False,
+        *,
+        legacy_expert_source_layout=None,
+    ):
         super().__init__(allow_partial_load=True)
+        if type(strict_gdn_fp32) is not bool:
+            raise TypeError("strict_gdn_fp32 must be a bool")
+        _validate_legacy_expert_source_layout(legacy_expert_source_layout)
         self.strict_model = strict_model
         self.expected_save_id = expected_save_id
         self.strict_gdn_fp32 = strict_gdn_fp32
+        self.legacy_expert_source_layout = legacy_expert_source_layout
 
     def create_local_plan(self):
         assert self.metadata is not None
@@ -298,16 +316,17 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     def _validate_expert_layouts(self):
         planner_data = self.metadata.planner_data or {}
         source = planner_data.get(_EXPERT_LAYOUTS_KEY)
+        source_tensors = {}
         if source is not None:
             if source["version"] != 1:
                 raise RuntimeError(f"Unsupported checkpoint expert layout version: {source['version']}")
-            for key in self.state_dict.keys() & source["tensors"].keys():
-                if source["tensors"][key]["expert_order"] != "canonical":
+            source_tensors = source["tensors"]
+            for key in self.state_dict.keys() & source_tensors.keys():
+                if source_tensors[key]["expert_order"] != "canonical":
                     raise RuntimeError(
-                        f"Checkpoint tensor {key!r} has noncanonical expert order: {source['tensors'][key]}. "
+                        f"Checkpoint tensor {key!r} has noncanonical expert order: {source_tensors[key]}. "
                         "Migrate model and optimizer state using the original training layout before loading."
                     )
-            return
 
         # Checkpoints produced by the earlier version of this feature already
         # used canonical coordinates, but did not record individual layouts.
@@ -321,22 +340,25 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             return
 
         for key, value in self.state_dict.items():
+            if key in source_tensors:
+                continue
             layout = _expert_layout(value)
             saved = self.metadata.state_dict_metadata.get(key)
-            if saved is None:
+            if saved is None or not torch.is_tensor(value) or not hasattr(saved, "size"):
                 continue
-            # Unversioned chunks cannot distinguish a safe EP+row-FSDP layout
-            # from the same-axis legacy bug combined with another parallel
-            # axis. Only a source chunk spanning all experts is unambiguous.
+            # Unversioned chunks cannot identify the source EP axis. The
+            # target axis is not source evidence: a source sharded along one
+            # axis can appear whole along a different target expert axis.
             if layout is None:
                 # Offline export uses a plain CPU tensor as its target. Old
                 # stacked expert weights still require the same source check.
-                if "experts" not in key.split(".") or len(saved.size) < 2:
+                if "experts" not in key.split("."):
                     continue
-                ep_dim = 0
-            else:
-                ep_dim = layout["ep_shard_dim"]
-            if all(chunk.sizes[ep_dim] == saved.size[ep_dim] for chunk in saved.chunks):
+            if all(tuple(chunk.sizes) == tuple(saved.size) for chunk in saved.chunks):
+                continue
+            # This declaration is a trusted statement about the source, not
+            # an inference from target topology or ambiguous chunk geometry.
+            if self.legacy_expert_source_layout is not None:
                 continue
             raise RuntimeError(
                 f"Cannot determine source expert order for {key!r} in this unversioned checkpoint. "
@@ -1031,7 +1053,6 @@ class _ProvenModelState(ModelState):
         super().__init__(*args, **kwargs)
         self.optimizer = optimizer
         self.group = group
-        self.writing = writing
 
     def state_dict(self):
         result, error = None, None
@@ -1048,10 +1069,6 @@ class _ProvenModelState(ModelState):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "constructing proven model state", group=self.group)
-        if self.writing:
-            from .rank_local_optimizer import verify_replicated_model_shards
-
-            verify_replicated_model_shards(result, group=self.group)
         return result
 
     def load_state_dict(self, state_dict):
@@ -1898,6 +1915,11 @@ class DistributedCheckpointer(CheckpointerBase):
             error = None
             try:
                 parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+                if "_veomni_scheduler_object" not in state:
+                    raise RuntimeError(
+                        "MultiOptimizer checkpoint requires an explicit scheduler declaration; "
+                        "set _veomni_scheduler_object to the scheduler or None"
+                    )
                 if save_async:
                     raise RuntimeError("Proven MultiOptimizer checkpoints currently require synchronous DCP save")
                 _validate_source_optimizer_states(optimizer, source_model)
@@ -2126,10 +2148,19 @@ class DistributedCheckpointer(CheckpointerBase):
         module: str = "",
         trainable_only: bool = False,
         parallel_state=None,
+        legacy_expert_source_layout: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Load a checkpoint, invalidating file-backed state after any failure."""
         try:
-            return cls._load_impl(path, state, process_group, module, trainable_only, parallel_state)
+            return cls._load_impl(
+                path,
+                state,
+                process_group,
+                module,
+                trainable_only,
+                parallel_state,
+                legacy_expert_source_layout=legacy_expert_source_layout,
+            )
         except BaseException:
             try:
                 optimizer = state.get("optimizer") if isinstance(state, dict) else None
@@ -2151,6 +2182,8 @@ class DistributedCheckpointer(CheckpointerBase):
         module: str = "",
         trainable_only: bool = False,
         parallel_state=None,
+        *,
+        legacy_expert_source_layout: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -2167,6 +2200,9 @@ class DistributedCheckpointer(CheckpointerBase):
             process_group: process group for loading checkpoint
             module: name of the model to load, for a job that trains several.
                 Empty for a single-model job. See :meth:`save`.
+            legacy_expert_source_layout: Optional, trusted declaration of an
+                unversioned model-only checkpoint's source layout. It must be
+                identical on all ranks and cannot be used for optimizer restore.
             trainable_only: when True, ``set_model_state_dict`` runs in non-strict
                 mode (``StateDictOptions(strict=False)``). Use this for LoRA / PEFT
                 resumes where the DCP only contains trainable adapter weights and the
@@ -2220,6 +2256,9 @@ class DistributedCheckpointer(CheckpointerBase):
         )
         try:
             wants_optimizer = state.get("optimizer") is not None
+            _validate_legacy_expert_source_layout(legacy_expert_source_layout)
+            if legacy_expert_source_layout is not None and optimizer is not None:
+                raise ValueError("Legacy expert source declarations are only supported for model-only loads")
             fused_dir = cls._legacy_fused_dir(path, module)
             model_state = _model_state()
             optimizer_state = _optimizer_state() if wants_optimizer and not multi else None
@@ -2255,6 +2294,11 @@ class DistributedCheckpointer(CheckpointerBase):
             error = None
             try:
                 parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+                if "_veomni_scheduler_object" not in state:
+                    raise RuntimeError(
+                        "MultiOptimizer checkpoint requires an explicit scheduler declaration; "
+                        "set _veomni_scheduler_object to the scheduler or None"
+                    )
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "validating MultiOptimizer checkpoint policy", group=process_group)
@@ -2399,7 +2443,9 @@ class DistributedCheckpointer(CheckpointerBase):
                 storage_reader=model_reader,
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(
-                    strict_model=not trainable_only, strict_gdn_fp32=is_qwen4_exp_model(state["model"])
+                    strict_model=not trainable_only,
+                    strict_gdn_fp32=is_qwen4_exp_model(state["model"]),
+                    legacy_expert_source_layout=legacy_expert_source_layout,
                 ),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
@@ -2412,7 +2458,9 @@ class DistributedCheckpointer(CheckpointerBase):
             storage_reader=model_reader,
             process_group=process_group,
             planner=_ModelStrictLoadPlanner(
-                strict_model=not trainable_only, strict_gdn_fp32=is_qwen4_exp_model(state["model"])
+                strict_model=not trainable_only,
+                strict_gdn_fp32=is_qwen4_exp_model(state["model"]),
+                legacy_expert_source_layout=legacy_expert_source_layout,
             ),
         )
         if wants_optimizer:
@@ -2843,7 +2891,10 @@ def _process_shard(
     checkpoint_path: str,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
     preserve_fp32_keys: Optional[Set[str]] = None,
+    *,
+    legacy_expert_source_layout: Optional[str] = None,
 ) -> str:
+    _validate_legacy_expert_source_layout(legacy_expert_source_layout)
     reader = FileSystemReader(checkpoint_path)
     metadata = reader.read_metadata()
 
@@ -2873,7 +2924,7 @@ def _process_shard(
         state_dict,
         checkpoint_id=checkpoint_path,
         storage_reader=FileSystemReader(checkpoint_path),
-        planner=_ModelStrictLoadPlanner(strict_model=True),
+        planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout=legacy_expert_source_layout),
         no_dist=True,
     )
 
@@ -2906,19 +2957,25 @@ def _process_shard(
     return processed_dict
 
 
-def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> STATE_DICT_TYPE:
+def dcp_to_torch_state_dict(
+    save_checkpoint_path: Union[str, os.PathLike], *, legacy_expert_source_layout: Optional[str] = None
+) -> STATE_DICT_TYPE:
     """
     Given a directory containing a DCP checkpoint, this function will convert it into a
     Torch state_dict.
 
     Args:
         save_checkpoint_path: Directory containing the DCP checkpoint.
+        legacy_expert_source_layout: Trusted declaration of the source's legacy
+            expert layout. See ``docs/usage/checkpoint.md`` for its contract.
 
     .. warning::
         To avoid OOM, it's recommended to only run this function on a single rank.
     """
     shard, _, _ = _get_sharding_plan(save_checkpoint_path)
 
-    processed_dict = _process_shard(shard, save_checkpoint_path)
+    processed_dict = _process_shard(
+        shard, save_checkpoint_path, legacy_expert_source_layout=legacy_expert_source_layout
+    )
 
     return processed_dict

@@ -354,11 +354,44 @@ non-persistent ExtraParallel shard in a checkpoint must use the canonical
 layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
 identifies canonical global values independently of source geometry, so DCP can
 reshard a model checkpoint across supported FSDP shard axes. Use
-`DistributedCheckpointer` for save and resume: it rejects old/unversioned
-layouts before copying model tensors. Migrating a legacy checkpoint requires
-verified source layout information. Canonical v2 optimizer save and resume use
+`DistributedCheckpointer` for save and resume: it rejects ambiguous unversioned
+expert layouts before copying model tensors unless the model-only source is
+explicitly declared as described below. Migrating a legacy optimizer checkpoint
+requires verified source layout information. Canonical v2 optimizer save and resume use
 the rank-local codec described below. The standard VeOmni HF export strips the
 namespace.
+
+### Known legacy VeOmni model-only sources
+
+An unversioned checkpoint does not record its producing EP/FSDP geometry. If
+the caller has independently verified that **every expert tensor** came from
+the legacy standard VeOmni TP1 implementation with expert axis 0 and FSDP
+axis 1, they may explicitly declare `legacy_expert_source_layout="veomni_tp1_ep0_fsdp1"`
+on `DistributedCheckpointer.load` or `dcp_to_torch_state_dict`. All ranks must
+provide the same declaration. A legacy VeOmni TP1 source that used no expert
+parallelism at all can instead be declared as `"veomni_tp1_no_ep"`. A missing
+declaration keeps ambiguous sources
+fail-closed. This is a trusted assertion about the source, not a conclusion drawn
+from target geometry or the DCP chunks. In particular, do not declare this for
+same-axis Muon/EP checkpoints or external TP-produced shards. An incorrect
+assertion can silently permute experts. The declaration supports model-only
+restore/export and is rejected when restoring an optimizer; it does not migrate
+optimizer groups, moments, master weights or scheduler state. It does not load
+directly into the canonical v2 namespace: export the verified legacy weights
+and load them as model weights into the v2 target instead.
+This also applies to old non-EP optimizer checkpoints: an unversioned,
+FSDP-sharded expert bias or moment without source provenance can be rejected.
+Neither source declaration authorizes optimizer-state migration.
+When per-tensor source layout metadata is present, a recorded noncanonical
+expert is always rejected. Missing metadata for one expert is not inferred
+from the presence of metadata for another expert.
+
+For CLI export, pass `--legacy-expert-source-layout veomni_tp1_ep0_fsdp1` to
+`scripts/merge_dcp_to_hf.py` only after verifying the source. Use
+`--save-dtype preserve` when the checkpoint contains FP32 tensors that must not
+be rounded to BF16; the CLI retains its historical BF16 export default. This
+preserves tensor dtypes on disk; consumers must configure their loader to avoid
+subsequently casting the FP32 tensors.
 
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
@@ -374,6 +407,42 @@ the namespaces differ. Replicated values must already agree across ranks.
 
 Optimizer authors can find the registration callbacks and precision/placement
 contract in the [rank-local AdamW adapter guide](../design/rank_local_adamw_checkpoint_adapter.md).
+
+**Breaking change relative to earlier VeOmni checkpoint behavior:**
+
+- MultiOptimizer DCP save now requires `save_async: false`. Existing async
+  MultiOptimizer jobs must switch to synchronous save before adopting this
+  codec; model-only and ordinary-optimizer async paths remain separate.
+- A MultiOptimizer checkpoint can only resume with the recorded owner, mesh,
+  world size and optimizer layout. It cannot be restored across an EP/FSDP
+  shard-axis or world-size change, even when model weights can be resharded.
+- Older MultiOptimizer checkpoints whose parameter-group and scheduler identity
+  cannot be proven are rejected. The repository does not yet provide a
+  validated general migration for these checkpoints. Continue with the
+  original compatible runtime or use an explicitly accepted weights-only
+  restart with new optimizer/scheduler state; that is not an exact continuation.
+
+Supported CPU optimizer offload adapters are independent of asynchronous DCP
+save and remain available with synchronous checkpointing. A future migration must preserve
+owner-specific master weights, moments and step counters as well as optimizer
+groups and scheduler state, and verify the next update against the source.
+
+Direct `DistributedCheckpointer` calls containing a `MultiOptimizer` must include
+`"_veomni_scheduler_object"` in the state, set to the supported live scheduler
+or explicitly to `None` for runs without a scheduler. This declaration is a
+trusted contract: a caller must not declare `None` when a scheduler is in use.
+The framework checkpoint manager supplies the declaration and restores the
+scheduler automatically. A direct `DistributedCheckpointer.load` caller must
+apply the returned scheduler state to the live scheduler before continuing:
+
+```python
+state = {"model": model, "optimizer": optimizer, "extra_state": {},
+         "_veomni_scheduler_object": scheduler}
+DistributedCheckpointer.load(path, state)
+scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+```
+
+Unregistered schedulers are not supported by the proven resume codec.
 
 Use `DistributedCheckpointer` for training checkpoints containing a
 `MultiOptimizer`. The save is synchronous and requires a completed optimizer
@@ -395,12 +464,13 @@ optimizer shards and does not support elastic resharding. All ranks must use
 the same trusted model and configuration. Optimizer leaf ordering is checked
 as part of the existing checkpoint-layout exchange; owner-specific freezing
 that removes a whole leaf from only some ranks is rejected before per-leaf
-checkpoint collectives, rather than supported. Replicated values are assumed synchronized,
-while checkpoint shard dtype, shape and geometry are validated without hashing
-tensor bytes. Hooks and adapters are trusted. MultiOptimizer asynchronous saves
+checkpoint collectives, rather than supported. Replica values, trainability, dtype, shape and geometry
+are trusted to be consistent across ranks. Source and target checkpoint layout
+metadata are checked during restore; no tensor bytes are hashed. Hooks and
+adapters are trusted. MultiOptimizer asynchronous saves
 and unsupported layouts fail closed; synchronous staged saves are supported.
-Partially overlapping shards with different geometries are rejected, even when
-their shared values agree; exact replicas and disjoint shards remain supported.
+The runtime assumes ranks use a consistent model configuration and compatible
+replica geometries; saved source layout is validated on restore.
 Group/state inventory and generation mismatches are rejected before model
 copying. If an I/O or optimizer-application error occurs after model copying,
 the load fails and clears its receipt but does not roll back in-memory objects;
