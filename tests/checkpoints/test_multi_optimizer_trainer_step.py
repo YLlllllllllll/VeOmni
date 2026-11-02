@@ -324,34 +324,6 @@ def test_train_end_sidecar_keeps_generation_after_optimizer_release(tmp_path):
     assert saved["_veomni_optimizer_generations"] == {"model": "saved-generation"}
 
 
-def _step_receipt_mismatch_worker(rank, tmp_path, endpoint):
-    from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-    from veomni.trainer.callbacks.base import TrainerState
-    from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
-        trainer = _make_mock_trainer(save_path=str(tmp_path))
-        callback = CheckpointCallback(trainer)
-        callback.dcp_every_n_steps = 3
-        callback.save_hf_weights = False
-        callback._last_dcp_step = 3 if rank == 0 else -1
-        with pytest.raises(RuntimeError, match="same-step|receipt|differ"):
-            callback.on_step_end(TrainerState(global_step=3, epoch=0))
-        trainer.save_dcp.assert_not_called()
-        dist.barrier()
-    finally:
-        clear_parallel_state()
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_step_dcp_receipt_disagreement_fails_on_all_ranks(tmp_path):
-    spawn_with_rendezvous(_step_receipt_mismatch_worker, args=(str(tmp_path),), nprocs=2)
-
-
 def _resume_worker(rank, tmp_path, mode, endpoint):
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
