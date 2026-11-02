@@ -5,6 +5,11 @@ under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
 the model assets are written once to `output_dir/model_assets/`
 (`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni)).
 
+All ranks must use the same checkpoint paths, save schedule and model/parallel
+configuration. The trainer does not compare a copy of that shared configuration
+on every rank. Some rank-local checkpoint and cursor operations coordinate
+failures; this is not a guarantee for every I/O path.
+
 ```
 checkpoints/global_step_{N}/
 ├── checkpoint_manifest.json      # completion marker, rank 0 writes it last
@@ -31,7 +36,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
 | `model/**/lr_scheduler.pt` | `lr_scheduler.state_dict()`. | Rank 0 |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
-| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`. | Rank R |
+| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`; DPO runs also include `dpo_provenance_protocol` and `dpo_position`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
@@ -44,6 +49,83 @@ nothing else. The two exports are inference artifacts that resume never reads.
 `config.json`, `generation_config.json`, then tokenizer files, processor files,
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
+
+DPO's `dpo_provenance_protocol` records the producer contract, objective and
+recovery geometry; `dpo_position` contains `epoch`, `step_in_epoch` and
+`epoch_complete`. Resume requires both fields and matching positions across
+ranks; missing or incompatible state is rejected before training continues.
+Trainer-state recovery currently supports the native mapping dataset, native
+dataloader and standard stateful distributed sampler without persistent
+workers, a custom loader generator, out-of-order workers or background prefetch.
+Native DPO loaders take a worker snapshot at every source step, including
+fixed-batch runs, because one optimizer step can consume uneven microbatches.
+Other configurations can still be used for
+fresh training where supported, but their trainer-state exact resume is
+rejected. Set `data.resume_input_contract` and `data.resume_input_deterministic`
+as described below; the trusted input manifest must also cover the immutable
+DPO reference-model weights. The saved dataset fingerprint is checked as an
+additional guard, not as a substitute for the manifest. Python, NumPy, and
+custom-component random states are not captured by this callback; data and
+worker transforms must also be deterministic, since worker torch RNG is not
+restored by this protocol. Recovery may temporarily copy the buffered samples
+on the host. The native multi-worker recovery checks were exercised with PyTorch 2.10 and torchdata
+0.11; other versions require their own validation.
+
+For native fixed-batch DPO on mapping datasets, `drop_last=False` includes a
+short final batch. Its optimizer step can contain fewer nonempty microbatches
+and is normalized by the actual pair count. The native distributed sampler may
+repeat samples to equalize DP ranks when the data size is not divisible by DP;
+the DPO microbatch collator does not add padding or replay.
+
+For main-process dynamic batching in the text and VLM trainers, exact resume
+requires a native mapping dataset with an unchanged dataset fingerprint, the
+native stateful and batch samplers, snapshots at every source step, no custom
+data-loader generator, in-order workers and disabled background prefetch.
+The checkpoint records the data/worker geometry, epoch length, source settings
+and input-parallel settings. A changed or missing cursor, geometry, source
+fingerprint or RNG state is rejected. Worker-mode batching and custom or
+iterable sources use separate paths and are not qualified by this contract.
+Exact continuation starts after a completed optimizer step; step-zero cursors
+are rejected because iterator initialization may advance CPU RNG.
+
+When the model checkpoint manager provides strict MultiOptimizer generation
+receipts, the trainer sidecar records that generation and recovery requires it
+to match the optimizer checkpoint and step. Checkpoint managers without this
+protocol retain their existing behavior; their optimizer-to-cursor identity is
+not established by the dynamic-batching cursor checks alone.
+
+Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
+before training, and set `data.resume_input_deterministic=true` only when the
+input snapshot, tokenizer, chat template, processor, collator and transforms are
+immutable and deterministic. The digest is a **caller attestation**, not a
+hash that VeOmni independently computes from those inputs. It must identify a
+trusted manifest covering those components and their code/configuration. The
+same digest and settings are required on resume. A missing contract emits a
+startup warning; training and export can proceed, but dynamic SFT trainer-state
+resume is rejected because its cursor cannot be proven exact. To start a new
+data stream, load the model weights as a new run instead of resuming its trainer
+state. Other trainer paths keep their existing resume contracts, including
+their own strict optimizer and data-codec checks where applicable.
+
+At a completed SFT epoch, nonpersistent in-order workers preserve the buffered
+samples and start the next epoch with a fresh sampler. Persistent workers at an
+epoch boundary, stochastic transforms or independent worker RNG state are not
+qualified. Legacy cursors without the saved geometry, source contract and phase
+are rejected. No legacy migration tool is provided here: old releases differed
+in step accounting and batching behavior, so migration requires a separately
+verified producer-specific implementation. Starting a new data stream requires
+a new training run rather than claiming exact continuation from that cursor.
+Exhausted one-shot sources cannot be drained independently by each rank as a
+distributed continuation; use a restartable source or coordinated exhaustion.
+For safety, cursors written by the prior exhausted-source experiment with its
+exhaustion flag set are rejected instead of reopening the source. This does
+not coordinate ordinary input exhaustion across ranks.
+With background prefetch enabled, exact resume of `drop_last=False` flush
+batches assumes consumers do not mutate yielded microbatches; prefetch can
+snapshot the cursor before such a mutation. Prefetching can also advance a
+restarted source's CPU RNG ahead of the consumed cursor, so model RNG may
+diverge after resume even when the text samples are deterministic. Validate
+the loader and prefetch configuration used by a training profile.
 
 Three splits in the tree above are deliberate:
 
@@ -174,6 +256,13 @@ The cursor files follow the same cadences as the model state, including HF and
 LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
 its `loader/`, `extra_state/` and manifest too, instead of being left invisible
 to resume.
+
+When resuming a legacy Adam checkpoint into its original output directory, the
+trainer reuses an unchanged same-step checkpoint only after verifying the
+completed manifest, optimizer identity, RNG state and available data cursor.
+If those cannot be established, use a different output directory: this avoids
+overwriting the source checkpoint during an immediate epoch-end or HF export.
+This guard does not claim exact recovery for legacy optimizer formats.
 
 Checkpoints from older layouts have no manifest; discovery falls back to a
 `.metadata` at the step root, which is what marked those steps complete, but

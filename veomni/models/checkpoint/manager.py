@@ -32,7 +32,9 @@ Two blobs, two owners:
 import hashlib
 import marshal
 import math
+import os
 import types
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
@@ -205,6 +207,17 @@ class ModelCheckpointManager:
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
         self._last_saved_optimizer_generation = None
+        self._last_saved_step_path = None
+        self._saved_step_paths = []
+        self._invalidated_saved_step_paths = []
+        self._last_legacy_export_dcp_step = None
+        self._last_saved_optimizer_ref = None
+        self._loaded_optimizer_ref = None
+        self._loaded_checkpoint_path = None
+        self._loaded_checkpointer = None
+        self._last_saved_without_optimizer = False
+        self._last_export_validated_step = None
+        self._last_export_released_optimizer = False
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
@@ -290,9 +303,24 @@ class ModelCheckpointManager:
             "parallel_state": self.parallel_state,
         }
 
+    def _invalidate_saved_receipt(self) -> None:
+        self._last_saved_step = -1
+        self._last_saved_step_path = None
+        self._last_legacy_export_dcp_step = None
+        self._last_saved_optimizer_ref = None
+        self._last_saved_without_optimizer = False
+        self._last_export_validated_step = None
+        self._last_export_released_optimizer = False
+        if hasattr(self, "_last_saved_optimizer_generation"):
+            self._last_saved_optimizer_generation = None
+
     def wait_for_pending_save(self) -> None:
         """Block until the in-flight async save is on disk, if there is one."""
-        self.checkpointer.wait_for_pending_save()
+        try:
+            self.checkpointer.wait_for_pending_save()
+        except BaseException:
+            self._invalidate_saved_receipt()
+            raise
 
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
         """Model-bound state to store beside the weights.
@@ -328,129 +356,140 @@ class ModelCheckpointManager:
 
     def load(self) -> None:
         """Restore model, optimizer and model-bound extra state from ``load_path``."""
+        self._invalidated_saved_step_paths.extend(self._saved_step_paths)
+        self._saved_step_paths.clear()
+        self._invalidate_saved_receipt()
+        self._loaded_optimizer_ref = None
+        self._loaded_checkpoint_path = None
+        self._loaded_checkpointer = None
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
-        load_dir = self.load_dir()
+        load_dir, error = None, None
+        try:
+            load_dir = self.load_dir()
+            if load_dir is not None:
+                load_dir = os.fspath(load_dir)
+                if not isinstance(load_dir, str):
+                    raise TypeError("Checkpoint load path must be a string")
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint load path")
         if load_dir is None:
             return
 
-        self.wait_for_pending_save()
-        state: Dict[str, Any] = {
-            "model": self.runtime.model,
-            "optimizer": self.runtime.optimizer,
-            "extra_state": {},
-            "_veomni_scheduler_object": self.runtime.lr_scheduler,
-        }
-        multi = getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True
-        error = None
+        optimizer, scheduler, checkpointer, state, kwargs, error = None, None, None, None, None, None
         try:
-            self.checkpointer.load(load_dir, state, **self._checkpointer_kwargs())
+            optimizer = self.runtime.optimizer
+            scheduler = self.runtime.lr_scheduler
+            checkpointer = self.checkpointer
+            state = {
+                "model": self.runtime.model,
+                "optimizer": optimizer,
+                "extra_state": {},
+                "_veomni_scheduler_object": scheduler,
+            }
+            kwargs = self._checkpointer_kwargs()
         except BaseException as exc:
             error = exc
-        if multi:
-            raise_if_any_rank_failed(error, "loading MultiOptimizer checkpoint")
-        elif error is not None:
-            raise error
-        error, step = None, None
+        raise_if_any_rank_failed(error, "preparing checkpoint load arguments")
+        error = None
         try:
+            self.wait_for_pending_save()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "waiting before checkpoint load")
+        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
+        step = generation = None
+        error = None
+        try:
+            checkpointer.load(load_dir, state, **kwargs)
             if multi:
                 if state.get("_veomni_optimizer_identity_verified") is not True:
                     raise RuntimeError("MultiOptimizer checkpoint identity has not been proven")
                 step = state["extra_state"].pop("_veomni_optimizer_global_step", None)
                 if type(step) is not int or step < 0:
                     raise RuntimeError("MultiOptimizer checkpoint is missing its proven trainer global step")
-                if "_veomni_scheduler_recipe" not in state["extra_state"]:
-                    raise RuntimeError("MultiOptimizer checkpoint scheduler identity is missing")
-                recipe = state["extra_state"].pop("_veomni_scheduler_recipe")
+                recipe = state["extra_state"].pop("_veomni_scheduler_recipe", None)
                 if (
                     not isinstance(recipe, dict)
                     or recipe.get("status") != "supported"
                     or set(recipe) != {"status", "value"}
                 ):
-                    raise RuntimeError("MultiOptimizer checkpoint scheduler identity is unsupported")
-                if recipe["value"] != _scheduler_recipe(self.runtime.lr_scheduler, self.runtime.optimizer):
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler identity is missing or unsupported")
+                if recipe["value"] != _scheduler_recipe(scheduler, optimizer):
                     raise RuntimeError("MultiOptimizer checkpoint scheduler identity differs")
                 saved_scheduler = state["extra_state"].get("lr_scheduler")
-                scheduler = self.runtime.lr_scheduler
                 if (scheduler is None) != (saved_scheduler is None) or (
                     scheduler is not None and not isinstance(saved_scheduler, dict)
                 ):
                     raise RuntimeError("MultiOptimizer checkpoint scheduler state is missing or incompatible")
                 if scheduler is not None:
                     _validate_scheduler_checkpoint(saved_scheduler, scheduler.state_dict(), step)
-                    _validate_scheduler_optimizer_lrs(saved_scheduler, self.runtime.optimizer)
+                    _validate_scheduler_optimizer_lrs(saved_scheduler, optimizer)
+                generation = state.get("_veomni_optimizer_checkpoint_generation")
+                if not isinstance(generation, str) or not generation:
+                    raise RuntimeError("MultiOptimizer checkpoint generation is missing")
             self._load_extra_state(state["extra_state"])
+            if self.runtime.optimizer is not optimizer or self.runtime.lr_scheduler is not scheduler:
+                raise RuntimeError("Optimizer or scheduler changed while restoring the checkpoint")
+            if self.checkpointer is not checkpointer:
+                raise RuntimeError("Checkpoint provider changed while restoring the checkpoint")
         except BaseException as exc:
             error = exc
-        if multi:
-            raise_if_any_rank_failed(error, "restoring MultiOptimizer trainer step and scheduler")
-            generation = state.get("_veomni_optimizer_checkpoint_generation")
-            error = (
-                RuntimeError("MultiOptimizer checkpoint generation is missing")
-                if not isinstance(generation, str) or not generation
-                else None
-            )
-            raise_if_any_rank_failed(error, "checking restored MultiOptimizer generation")
-        elif error is not None:
-            raise error
-        try:
-            dist.barrier()
-        except BaseException:
-            optimizer = state.get("optimizer")
+
+        def abort_file_backed():
             leaves = getattr(optimizer, "optimizers_dict", {})
-            targets = [optimizer, *(leaves.values() if isinstance(leaves, dict) else ())]
-            for leaf in targets:
+            for leaf in [optimizer, *(leaves.values() if isinstance(leaves, dict) else ())]:
                 abort = getattr(leaf, "checkpoint_abort_file_backed_state", None)
                 if callable(abort):
                     try:
                         abort()
                     except Exception:
-                        pass  # Keep the original barrier error.
+                        pass
+
+        try:
+            raise_if_any_rank_failed(error, "checking restored optimizer identity")
+            dist.barrier()
+        except BaseException:
+            abort_file_backed()
             raise
         if multi:
             self._loaded_optimizer_global_step = step
             self._loaded_optimizer_generation = generation
+        if optimizer is not None:
+            try:
+                self._loaded_optimizer_ref = weakref.ref(optimizer)
+            except TypeError:
+                self._loaded_optimizer_ref = None
+        self._loaded_checkpoint_path = load_dir
+        self._loaded_checkpointer = checkpointer
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
-        """Write model, optimizer and model-bound extra state for ``state.global_step``.
-
-        Only model-bound state goes in here. Job-level state — where the
-        dataloader is, the rng — has its own writer.
-        """
-        self._last_saved_optimizer_generation = None
-        if self._last_saved_step == state.global_step:
-            # A failed rewrite may already have invalidated the old DCP marker.
-            # A later export must not reuse the previous same-step receipt.
-            self._last_saved_step = -1
-        multi = getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True
-        error, extra_state = None, None
+        """Write model, optimizer and model-bound extra state for this step."""
+        self._invalidate_saved_receipt()
+        optimizer, optimizer_ref, error, extra_state, kwargs, step_path = None, None, None, None, None, None
         try:
+            step_path = self.step_dir(state)
+            if any(layout.same_checkpoint_path(step_path, path) for path in self._invalidated_saved_step_paths):
+                raise RuntimeError("Cannot overwrite a checkpoint after loading without a new verified receipt")
+            optimizer = self.runtime.optimizer
+            try:
+                optimizer_ref = weakref.ref(optimizer) if optimizer is not None else None
+            except TypeError:
+                optimizer_ref = None
             extra_state = self._extra_state(state)
+            kwargs = self._checkpointer_kwargs()
+            helper.empty_cache()
         except BaseException as exc:
             error = exc
-        if multi:
-            raise_if_any_rank_failed(error, "preparing MultiOptimizer model extra state")
-        elif error is not None:
-            raise error
-
-        def clear_cache(stage):
-            error = None
-            try:
-                helper.empty_cache()
-            except BaseException as exc:
-                error = exc
-            if multi:
-                raise_if_any_rank_failed(error, stage)
-            elif error is not None:
-                raise error
-
-        clear_cache("clearing cache before MultiOptimizer checkpoint save")
+        raise_if_any_rank_failed(error, "preparing checkpoint save arguments")
+        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
         generation = self.checkpointer.save(
             self.config.save_path,
             {
                 "model": self.runtime.model,
-                "optimizer": self.runtime.optimizer,
+                "optimizer": optimizer,
                 "extra_state": extra_state,
                 "_veomni_scheduler_object": self.runtime.lr_scheduler,
             },
@@ -459,20 +498,24 @@ class ModelCheckpointManager:
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
             stage_dir=self.config.stage_dir,
             save_timeout_seconds=self.config.save_timeout_seconds,
-            **self._checkpointer_kwargs(),
+            **kwargs,
         )
-        if multi:
-            error = (
-                RuntimeError("MultiOptimizer save did not return its checkpoint generation")
-                if not isinstance(generation, str) or not generation
-                else None
-            )
-            raise_if_any_rank_failed(error, "checking saved MultiOptimizer generation")
-        clear_cache("clearing cache after MultiOptimizer checkpoint save")
+        error = None
+        try:
+            if multi and (not isinstance(generation, str) or not generation):
+                raise RuntimeError("MultiOptimizer save did not return its checkpoint generation")
+            helper.empty_cache()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "checking saved checkpoint generation")
         dist.barrier()
         if multi:
             self._last_saved_optimizer_generation = generation
         self._last_saved_step = state.global_step
+        self._last_saved_step_path = step_path
+        self._saved_step_paths.append(step_path)
+        self._last_saved_optimizer_ref = optimizer_ref
+        self._last_saved_without_optimizer = optimizer is None
         logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
 
     def prepare_export(self, state: "TrainerState", stage: str) -> str:
@@ -486,17 +529,160 @@ class ModelCheckpointManager:
         ``GlobalStateCallback`` finishes such a step off with the cursor files
         and the manifest, so it resumes like any other.
         """
-        if self._last_saved_step != state.global_step:
-            dist.barrier()
-            self.save_dcp(state)
+        self._last_legacy_export_dcp_step = None
+        self._last_export_validated_step = None
+        self._last_export_released_optimizer = False
+        optimizer_before, changed_optimizer, needs_save, error = None, False, False, None
+        try:
+            optimizer_before = self.runtime.optimizer
+            changed_optimizer = (
+                self._last_saved_step == state.global_step
+                and optimizer_before is not None
+                and (
+                    self._last_saved_optimizer_ref is None or self._last_saved_optimizer_ref() is not optimizer_before
+                )
+            )
+            needs_save = self._last_saved_step != state.global_step or changed_optimizer
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint export decision")
+        if dist.is_initialized():
+            decisions = [None] * dist.get_world_size()
+            local = (state.global_step, needs_save, optimizer_before is None)
+            dist.all_gather_object(decisions, local)
+            if any(decision != local for decision in decisions):
+                self._last_saved_step = -1
+                self._last_saved_optimizer_ref = None
+                if hasattr(self, "_last_saved_optimizer_generation"):
+                    self._last_saved_optimizer_generation = None
+                raise RuntimeError("Checkpoint export save decision differs across ranks")
+        if changed_optimizer:
+            self._last_saved_step = -1
+            if hasattr(self, "_last_saved_optimizer_generation"):
+                self._last_saved_optimizer_generation = None
+        error = None
+        try:
+            if self._last_saved_step != state.global_step:
+                dist.barrier()
+                self.save_dcp(state)
+            self.wait_for_pending_save()
+            if self.runtime.optimizer is not optimizer_before:
+                raise RuntimeError("Optimizer changed while preparing the exported checkpoint")
+        except BaseException as exc:
+            # A failed asynchronous wait must not turn into a successful
+            # same-step receipt if a caller catches and retries the export.
+            self._last_saved_step = -1
+            self._last_saved_optimizer_ref = None
+            if hasattr(self, "_last_saved_optimizer_generation"):
+                self._last_saved_optimizer_generation = None
+            error = exc
+        try:
+            raise_if_any_rank_failed(error, "preparing the exported checkpoint")
+        except BaseException:
+            self._last_saved_step = -1
+            self._last_saved_optimizer_ref = None
+            if hasattr(self, "_last_saved_optimizer_generation"):
+                self._last_saved_optimizer_generation = None
+            raise
 
-        self.wait_for_pending_save()
+        # Older, non-MultiOptimizer managers have no generation receipt. Only
+        # record a legacy receipt after this export has confirmed the DCP.
+        optimizer = self.runtime.optimizer
+        if (
+            self._last_saved_step == state.global_step
+            and optimizer is not None
+            and self._last_saved_optimizer_ref is not None
+            and self._last_saved_optimizer_ref() is optimizer
+        ):
+            self._last_export_validated_step = state.global_step
+        if (
+            self._last_export_validated_step == state.global_step
+            and getattr(optimizer, "_is_multi_optimizer", False) is False
+        ):
+            self._last_legacy_export_dcp_step = state.global_step
 
         if stage == "train_end":
+            self._last_export_released_optimizer = self._last_export_validated_step == state.global_step
             self.runtime.optimizer = None
             self.runtime.lr_scheduler = None
 
         return self.weights_dir(state)
+
+    def checkpoint_receipt_is_current(self, step: int) -> bool:
+        """Check that a same-step DCP still represents this optimizer."""
+        if self._last_saved_step != step or getattr(self.checkpointer, "_async_save_failed", False) is True:
+            return False
+        optimizer = self.runtime.optimizer
+        if optimizer is None:
+            return self._last_saved_without_optimizer or self._last_export_released_optimizer
+        return self._last_saved_optimizer_ref is not None and self._last_saved_optimizer_ref() is optimizer
+
+    def confirm_loaded_checkpoint_for_reuse(self, step: int, generation: str) -> None:
+        """Bind a proven same-output resume to the freshly restored optimizer."""
+        optimizer = self.runtime.optimizer
+        if (
+            type(step) is not int
+            or not isinstance(generation, str)
+            or not generation
+            or getattr(self, "_loaded_optimizer_global_step", None) != step
+            or getattr(self, "_loaded_optimizer_generation", None) != generation
+            or getattr(optimizer, "_is_multi_optimizer", False) is not True
+            or self._loaded_optimizer_ref is None
+            or self._loaded_optimizer_ref() is not optimizer
+            or (self._invalidated_saved_step_paths and self._loaded_checkpoint_path is None)
+            or getattr(self.checkpointer, "_async_save_failed", False) is True
+        ):
+            raise RuntimeError("Cannot reuse an unproven optimizer checkpoint receipt")
+        try:
+            optimizer_ref = weakref.ref(optimizer)
+        except TypeError as exc:
+            raise RuntimeError("Restored optimizer cannot be bound to the checkpoint receipt") from exc
+        self._last_saved_step = step
+        self._last_saved_step_path = self._loaded_checkpoint_path
+        if self._loaded_checkpoint_path is not None:
+            self._saved_step_paths.append(self._loaded_checkpoint_path)
+        self._invalidated_saved_step_paths = [
+            path
+            for path in self._invalidated_saved_step_paths
+            if not layout.same_checkpoint_path(path, self._loaded_checkpoint_path)
+        ]
+        self._last_saved_optimizer_ref = optimizer_ref
+        self._last_saved_without_optimizer = False
+        self._last_saved_optimizer_generation = generation
+        self._last_legacy_export_dcp_step = None
+        self._last_export_validated_step = None
+        self._last_export_released_optimizer = False
+
+    def confirm_legacy_loaded_checkpoint_for_reuse(self, step: int, load_path: str) -> None:
+        """Bind a legacy DCP only after its optimizer and trainer cursor restore."""
+        from ...checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        optimizer = self.runtime.optimizer
+        if (
+            type(step) is not int
+            or step < 0
+            or optimizer is None
+            or getattr(optimizer, "_is_multi_optimizer", False) is not False
+            or self._loaded_optimizer_ref is None
+            or self._loaded_optimizer_ref() is not optimizer
+            or self._loaded_checkpoint_path is None
+            or not layout.same_checkpoint_path(self._loaded_checkpoint_path, load_path)
+            or self._loaded_checkpointer is not DistributedCheckpointer
+            or self.checkpointer is not self._loaded_checkpointer
+            or getattr(self.checkpointer, "_async_save_failed", False) is True
+        ):
+            raise RuntimeError("Cannot reuse an unproven legacy optimizer checkpoint receipt")
+        self._last_saved_step = step
+        self._last_saved_step_path = load_path
+        self._saved_step_paths.append(load_path)
+        self._invalidated_saved_step_paths = [
+            path for path in self._invalidated_saved_step_paths if not layout.same_checkpoint_path(path, load_path)
+        ]
+        self._last_saved_optimizer_ref = self._loaded_optimizer_ref
+        self._last_saved_without_optimizer = False
+        self._last_legacy_export_dcp_step = step
+        self._last_export_validated_step = step
+        self._last_export_released_optimizer = False
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
         from ...utils.save_safetensor_utils import save_hf_safetensor
