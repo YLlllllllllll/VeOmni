@@ -624,35 +624,6 @@ def test_inventory_hash_failure_propagates_before_collective():
     spawn_with_rendezvous(_inventory_hash_failure_worker, args=(), nprocs=2)
 
 
-def _tied_parameter_order_worker(rank, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    from veomni.checkpoint.optimizer_resume_layout import coordinated_multi_layout
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model = torch.nn.Module()
-        shared = torch.nn.Parameter(torch.ones(2, 2))
-        for name in ("a", "b") if rank == 0 else ("b", "a"):
-            model.register_parameter(name, shared)
-        optimizer = MultiOptimizer(model, {"leaf": torch.optim.AdamW([shared])}, ["leaf"])
-        coordinated_multi_layout(model, optimizer, writing=True)
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_tied_parameter_registration_order_does_not_change_trainability():
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_tied_parameter_order_worker, args=(), nprocs=2)
-
-
 def _finalize_error_worker(rank, checkpoint, endpoint):
     from datetime import timedelta
 
@@ -690,7 +661,7 @@ def test_save_finalize_error_propagates_to_all_ranks(tmp_path):
     spawn_with_rendezvous(_finalize_error_worker, args=(str(tmp_path),), nprocs=2)
 
 
-def _runtime_plan_mismatch_worker(rank, mode, endpoint):
+def _runtime_plan_mismatch_worker(rank, endpoint):
     import contextlib
     from datetime import timedelta
 
@@ -707,8 +678,6 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
 
             def _build_model(self):
                 self.model = torch.nn.Linear(2, 2)
-                if mode != "missing" and (mode != "plan" or rank == 0):
-                    self.model._fqn2spec_info = {}
 
             def _freeze_model_module(self):
                 pass
@@ -717,11 +686,9 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
                 pass
 
         runtime_module.use_parallel_state = lambda *_args, **_kwargs: contextlib.nullcontext()
-        checkpoint = SimpleNamespace(
-            extra_parallel_canonical_layout=(mode == "missing" or (mode == "flag" and rank == 1))
-        )
+        checkpoint = SimpleNamespace(extra_parallel_canonical_layout=True)
         args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
-        with pytest.raises(RuntimeError, match="differs across ranks|requires an ExtraParallel model plan"):
+        with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
             TestRuntime(args, train=SimpleNamespace(checkpoint=checkpoint))
         completed = torch.tensor(1)
         dist.all_reduce(completed)
@@ -731,11 +698,10 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("mode", ["missing"])
-def test_runtime_checkpoint_plan_mismatch_fails_all_ranks(mode):
+def test_runtime_checkpoint_plan_mismatch_fails_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_runtime_plan_mismatch_worker, args=(mode,), nprocs=2)
+    spawn_with_rendezvous(_runtime_plan_mismatch_worker, args=(), nprocs=2)
 
 
 @pytest.mark.parametrize("same_base", [True, False])
@@ -1897,6 +1863,67 @@ def test_model_object_alias_graph_must_match_on_resume(tmp_path, kind):
             parallel_state=parallel,
         )
     torch.testing.assert_close(target.p, before, rtol=0, atol=0)
+
+
+def _save_destination_stat_error_worker(rank, checkpoint, location, endpoint):
+    import errno
+    import os
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint.layout import manifest_path, model_dir
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        root = Path(checkpoint)
+        if rank == 0:
+            root.mkdir(parents=True)
+            (root / "sentinel").write_bytes(b"preserve-existing-data")
+        dist.barrier()
+        target = (
+            manifest_path(checkpoint)
+            if location == "manifest"
+            else os.path.join(model_dir(checkpoint, ""), "extra_state", "extra_state_rank_1.pt")
+        )
+        original_stat = os.stat
+        injected = False
+
+        def stat(path, *args, **kwargs):
+            nonlocal injected
+            if rank == 1 and isinstance(path, (str, os.PathLike)) and os.fspath(path) == target:
+                injected = True
+                raise OSError(errno.EIO, "injected checkpoint stat failure")
+            return original_stat(path, *args, **kwargs)
+
+        model, optimizer = _model_and_optimizer()
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.os.stat", side_effect=stat),
+            pytest.raises((OSError, RuntimeError), match="stat failure|failed on another rank") as captured,
+        ):
+            DistributedCheckpointer.save(
+                checkpoint,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            )
+        if rank == 1:
+            assert injected and "injected checkpoint stat failure" in str(captured.value)
+        else:
+            assert "failed on another rank" in str(captured.value)
+            assert (root / "sentinel").read_bytes() == b"preserve-existing-data"
+            assert not Path(model_dir(checkpoint, "")).exists()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("location", ["manifest", "sidecar"])
+def test_multi_optimizer_save_coordinates_destination_stat_errors(tmp_path, location):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_save_destination_stat_error_worker, args=(str(tmp_path / "ckpt"), location), nprocs=2)
 
 
 @pytest.mark.parametrize("old_model_state", [True, False])

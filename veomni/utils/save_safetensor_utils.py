@@ -365,9 +365,9 @@ def save_hf_safetensor(
     """Save model weights in HuggingFace safetensors format.
 
     This function is self-contained w.r.t. synchronization: it calls ``synchronize()`` at
-    entry to flush pending GPU operations before reading tensor data, and calls
-    ``dist.barrier()`` before returning to ensure all ranks complete the save. Callers
-    do not need to add external synchronization around this function.
+    entry to flush pending GPU operations before reading tensor data. All ranks
+    coordinate completion and errors before returning; only rank 0 writes in legacy
+    mode. Callers do not need to add external synchronization around this function.
 
     Supports two modes:
     - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-LoRA): Uses HuggingFaceStorageWriter
@@ -586,12 +586,29 @@ def save_lora_adapter_with_dcp(
         single_file_per_rank=True,
         sync_files=False,
     )
-    if parallel_state is None and is_parallel_state_initialized():
-        parallel_state = get_parallel_state()
+    planner, error = None, None
+    try:
+        single_process = (
+            dist.get_world_size() == 1 if dist.is_initialized() else os.environ.get("WORLD_SIZE", "1") == "1"
+        )
+        planner = _ExtraParallelSavePlanner(
+            parallel_state=(
+                parallel_state
+                if parallel_state is not None
+                else get_parallel_state()
+                if is_parallel_state_initialized() or single_process
+                else None
+            ),
+            source_model=model,
+            adapter_name=adapter_name,
+        )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "preparing the LoRA checkpoint save planner")
     dcp.save(
         state_dict=dcp_lora_state,
         storage_writer=storage_writer,
-        planner=_ExtraParallelSavePlanner(parallel_state=parallel_state),
+        planner=planner,
     )
 
     if dist.is_initialized():
@@ -613,7 +630,9 @@ def save_lora_adapter_with_dcp(
                 consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
             )
 
-            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json.
+            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
+            # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
+            # separate sidecar).
             model.get_lora_config().save_pretrained(save_path)
 
             shutil.rmtree(dcp_save_path, ignore_errors=True)
