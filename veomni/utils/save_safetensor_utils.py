@@ -326,7 +326,11 @@ def _save_hf_safetensor_legacy(
     if qwen4_gdn_fp32:
         validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(model))
     save_model_weights(
-        save_hf_safetensor_path, model_state_dict, model_assets=model_assets, qwen4_gdn_fp32=qwen4_gdn_fp32
+        save_hf_safetensor_path,
+        model_state_dict,
+        model_assets=model_assets,
+        qwen4_gdn_fp32=qwen4_gdn_fp32,
+        legacy_fuse_fallback=True,
     )
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 

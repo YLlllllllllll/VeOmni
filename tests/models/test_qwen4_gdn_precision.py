@@ -298,6 +298,36 @@ def test_explicit_other_model_assets_keep_original_export_policy(tmp_path):
     assert load_file(str(tmp_path / "model.safetensors"))[next(iter(state))].dtype == torch.bfloat16
 
 
+def test_qwen4_hf_fuse_fallback_preserves_gdn_fp32(tmp_path, monkeypatch):
+    from safetensors import SafetensorError
+
+    from veomni.models.checkpoint import weights
+
+    source = _source_values()
+    state = {
+        "model.layers.0.linear_attn.A_log": source,
+        "model.layers.0.linear_attn.dt_bias": source + 0.01,
+        "model.layers.0.linear_attn.proj.weight": torch.tensor([0.12345679], dtype=torch.float32),
+    }
+    real_save = weights.save_file
+
+    def inject_enosys(data, path, metadata):
+        if str(path).startswith(str(tmp_path)):
+            raise SafetensorError("Error while serializing: I/O error: Function not implemented (os error 38)")
+        real_save(data, path, metadata=metadata)
+
+    monkeypatch.setattr(weights, "save_file", inject_enosys)
+    save_model_weights(str(tmp_path), state, qwen4_gdn_fp32=True, legacy_fuse_fallback=True)
+    exported = load_file(str(tmp_path / "model.safetensors"))
+    for name in ("A_log", "dt_bias"):
+        key = f"model.layers.0.linear_attn.{name}"
+        assert exported[key].dtype == torch.float32
+        assert torch.equal(exported[key], state[key])
+    key = "model.layers.0.linear_attn.proj.weight"
+    assert exported[key].dtype == torch.bfloat16
+    assert torch.equal(exported[key], state[key].bfloat16())
+
+
 def test_qwen4_hf_export_rejects_old_bf16_scalars(tmp_path):
     state = {f"model.layers.0.linear_attn.{name}": _source_values().bfloat16() for name in ("A_log", "dt_bias")}
     with pytest.raises(RuntimeError, match="Cannot export non-FP32 Qwen4 GDN"):
