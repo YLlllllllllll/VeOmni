@@ -275,11 +275,29 @@ def test_hf_missing_scalar_source_rejected():
 
 
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text", "qwen3_5"])
-def test_lora_bias_all_gdn_export_and_reload(tmp_path, model_type):
+@pytest.mark.parametrize("force_enosys", [False, True])
+def test_lora_bias_all_gdn_export_and_reload(tmp_path, model_type, force_enosys, monkeypatch):
     from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
     from veomni.lora.state_dict import load_adapter_state_dict
     from veomni.lora.weight_loading import load_lora_weights
     from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    attempts = []
+    if force_enosys:
+        from safetensors import SafetensorError
+
+        from veomni.models.checkpoint import weights
+
+        original_save = weights.save_file
+
+        def inject_enosys(data, path, metadata):
+            if str(path).startswith(str(tmp_path)):
+                attempts.append("destination")
+                raise SafetensorError("I/O error: Function not implemented (os error 38)")
+            attempts.append("local")
+            return original_save(data, path, metadata=metadata)
+
+        monkeypatch.setattr(weights, "save_file", inject_enosys)
 
     def make_model():
         base = ToyQwen4(model_type=model_type)
@@ -296,6 +314,8 @@ def test_lora_bias_all_gdn_export_and_reload(tmp_path, model_type):
     with torch.no_grad():
         model.get_base_model().linear_attn.dt_bias.copy_(source)
     save_lora_adapter_with_dcp(model, str(tmp_path))
+    if force_enosys:
+        assert attempts == ["destination", "local"]
     exported = load_adapter_state_dict(str(tmp_path))
     key = "base_model.model.linear_attn.dt_bias"
     assert key in exported

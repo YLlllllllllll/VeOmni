@@ -687,6 +687,38 @@ def test_noep_fsdp_lora_export_preserves_expert_layout(tmp_path, fail_consolidat
     spawn_with_rendezvous(_lora_noep_export_worker, args=(str(tmp_path), fail_consolidation), nprocs=2)
 
 
+def _lora_fuse_worker(rank, directory, ep_size, endpoint):
+    from unittest.mock import patch
+
+    from safetensors import SafetensorError
+
+    from veomni.models.checkpoint import weights
+
+    original_save = weights.save_file
+    save_attempts = []
+
+    def inject_enosys(data, path, metadata):
+        if str(path).startswith(directory):
+            save_attempts.append("destination")
+            raise SafetensorError("Error while serializing: I/O error: Function not implemented (os error 38)")
+        save_attempts.append("local")
+        original_save(data, path, metadata=metadata)
+
+    with patch.object(weights, "save_file", side_effect=inject_enosys):
+        if ep_size == 1:
+            _lora_noep_export_worker(rank, directory, False, endpoint)
+        else:
+            _lora_export_worker(rank, 4, 0, directory, 0, False, endpoint)
+    if rank == 0:
+        assert save_attempts == ["destination", "local"]
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
+@pytest.mark.parametrize("world", [2, 4])
+def test_lora_fuse_fallback_with_expert_layout(tmp_path, world):
+    spawn_with_rendezvous(_lora_fuse_worker, args=(str(tmp_path), world // 2), nprocs=world)
+
+
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [4])
 @pytest.mark.parametrize("shard_dim,ep_dim", [(0, 0), (1, 0), (0, -3)])

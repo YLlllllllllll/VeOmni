@@ -425,7 +425,8 @@ def save_hf_safetensor(
                 )
         except BaseException as exc:
             error = exc
-        raise_if_any_rank_failed(error, "rank-0 HuggingFace export")
+        group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(error, "rank-0 HuggingFace export", group=group)
         return
 
     # Ensure all ranks finish saving before anyone proceeds
@@ -607,7 +608,9 @@ def save_lora_adapter_with_dcp(
             # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
             consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
             adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-            _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+            _save_state_dict(
+                consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
+            )
 
             # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json.
             model.get_lora_config().save_pretrained(save_path)
@@ -616,7 +619,8 @@ def save_lora_adapter_with_dcp(
             logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
     except BaseException as exc:
         error = exc
-    raise_if_any_rank_failed(error, "rank-0 LoRA adapter export")
+    group = dist.group.WORLD if dist.is_initialized() else None
+    raise_if_any_rank_failed(error, "rank-0 LoRA adapter export", group=group)
 
     gc.collect()
     helper.empty_cache()
