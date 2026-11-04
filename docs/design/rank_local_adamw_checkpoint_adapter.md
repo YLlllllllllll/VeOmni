@@ -33,8 +33,9 @@ register each supported concrete optimizer type before saving or loading on
 every rank. Duplicate registration raises an error. Registration does not make
 an arbitrary optimizer compatible or automatically preserve its precision: the
 optimizer and its adapter own the correctness of their serialization and load
-behavior. The in-tree checkpoint adapter tests provide an illustrative
-registered implementation.
+behavior. `MasterFP32AdamW`, `FullFP32AdamW`, and `CPUOffloadAdamW` provide
+concrete in-tree examples; the checkpoint adapter tests also contain an
+illustrative registered implementation.
 
 An initialized parameter entry must contain exactly `step`, `master_weight`,
 `exp_avg`, and `exp_avg_sq`. The step is a rank-local plain scalar tensor, not
@@ -69,10 +70,10 @@ before applying state. During save,
 [`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L89)
 uses `state_dtype` to check initialized fields against their declared precision.
 During load,
-[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L408)
+[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L405)
 checks stored field dtypes and uses `state_is_offloaded` to allocate missing
 destination state on CPU when the adapter specifies offload.
-[`rank_local_adamw_context`](../../veomni/optim/checkpoint_adapter.py#L55)
+[`rank_local_adamw_context`](../../veomni/optim/checkpoint_adapter.py#L60)
 uses `context_factory` around the optimizer's actual state read and load;
 adapter implementations own correct placement and values.
 
@@ -87,7 +88,7 @@ must also be validated for an offloading implementation.
 
 ## Framework call sites and restore behavior
 
-1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L563)
+1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L619)
    enters the context around PyTorch's
    optimizer-state serialization. Registered adapter implementations must
    preserve live state and serialize all initialized fields and group options
@@ -98,7 +99,7 @@ must also be validated for an offloading implementation.
    load checks the checkpoint's identity, field names, dtypes and shapes before
    preparing initialized state for the saved owners. Rank-local ownership and
    the supported parallel geometry are not automatically resharded.
-3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L601)
+3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L657)
    enters the context again while
    PyTorch applies the optimizer state. The trusted adapter must restore every
    validated field without changing its value or dtype. An optimizer may

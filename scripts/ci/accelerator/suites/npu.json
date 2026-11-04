@@ -1,5 +1,10 @@
 [
   {
+    "name": "device-api-scoped-exceptions-unit",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/special_sanity/test_device_api_usage.py"]
+  },
+  {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
     "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
@@ -12,6 +17,18 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_ulysses.py"
+    ]
+  },
+  {
+    "name": "qwen4-hybrid-native-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_hybrid_u2cp2_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_gated_deltanet_hybrid_u2cp2_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence"
     ]
   },
   {
@@ -469,6 +486,34 @@
       "-s",
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "qwen38-cpu-offload-adamw-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_cpu_offload_adamw.py",
+      "tests/optim/test_cpu_offload_adamw_device.py",
+      "tests/optim/test_master_fp32_adamw.py"
+    ]
+  },
+  {
+    "name": "qwen38-muon-checkpoint-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_qwen38_muon.py",
+      "tests/optim/test_qwen38_muon_device.py",
+      "tests/optim/test_qwen38_muon_dormant_checkpoint.py",
+      "tests/optim/test_qwen38_cuda_preflight.py",
+      "tests/optim/test_qwen38_muon_distributed_builder.py",
+      "tests/optim/test_ple_world_profile.py",
+      "tests/optim/test_qwen38_fileback_current_dcp.py",
+      "tests/optim/test_file_backed_state.py",
+      "tests/optim/test_optimizer_vlm_param_groups.py"
     ]
   }
 ]

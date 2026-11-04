@@ -85,7 +85,15 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal[
+        "adamw",
+        "anyprecision_adamw",
+        "muon",
+        "master_fp32_adamw",
+        "full_fp32_adamw",
+        "cpu_offload_adamw",
+        "qwen38_muon",
+    ] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -248,7 +256,28 @@ class OptimizerConfig:
         },
     )
 
+    cpu_offload_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full parameter-name regexes selecting CPU master and moments for optimizer offload."},
+    )
+    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "Resident Adam moment precision; master remains FP32."}
+    )
+    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "CPU-offloaded Adam moment precision; master remains FP32."}
+    )
+    qwen38_ple_moments_scratch_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local scratch directory for FP32 PLE moments; rebuilt from DCP on resume."},
+    )
+    qwen38_ple_moments_world_profile: bool = field(
+        default=False,
+        metadata={"help": "Declare that all world ranks participate in the PLE scratch optimizer profile."},
+    )
+
     def __post_init__(self):
+        if isinstance(self.lr, (list, tuple)):
+            raise TypeError("Pass CPU-offload options by keyword; the second positional argument is learning rate")
         # YAML sequences arrive as lists; the declared tuple also prevents
         # optimizer defaults and groups from sharing mutable beta options.
         if isinstance(self.betas, list):
@@ -868,7 +897,15 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    allow_hybrid_cp: bool = field(
+        default=False,
+        metadata={"help": "Opt in to model-qualified combined Ulysses/CP; currently Qwen4-Exp only."},
+    )
+
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
+
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
@@ -913,7 +950,7 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "

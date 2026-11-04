@@ -26,6 +26,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     _extra_parallel_first_mesh,
     _extra_parallel_layout_key,
     _ExtraParallelSavePlanner,
+    _FileBackedSavePlanner,
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
     _process_shard,
@@ -36,6 +37,53 @@ from veomni.checkpoint.dcp_checkpointer import (
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("file_backed", [False, True])
+@pytest.mark.parametrize("slot", ["model", "optimizer"])
+def test_checkpoint_save_planner_receives_parallel_state(monkeypatch, file_backed, slot):
+    from veomni.checkpoint import dcp_checkpointer
+
+    parallel_state = object()
+    tracker = SimpleNamespace(checkpoint_evict_file_backed_state=lambda: None)
+    writer = SimpleNamespace()
+    if file_backed:
+        writer._veomni_file_optimizers = [tracker]
+
+    def capture_save(*, state_dict, storage_writer, planner):
+        assert storage_writer is writer
+        assert planner.parallel_state is parallel_state
+        assert isinstance(planner, _FileBackedSavePlanner if file_backed else _ExtraParallelSavePlanner)
+
+    monkeypatch.setattr(dcp, "save", capture_save)
+    monkeypatch.setattr(dcp_checkpointer, "empty_cache", lambda: None)
+    monkeypatch.setattr(dcp_checkpointer, "synchronize", lambda: None)
+    DistributedCheckpointer.execute_save(
+        {slot: {}}, writer, save_async=False, slot=slot, parallel_state=parallel_state
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_file_backed_planner_reclaims_previous_resolved_tensor():
+    class Tracker:
+        def __init__(self):
+            self.consumed = []
+
+        def checkpoint_commit_tensor(self, value):
+            self.consumed.append(value)
+
+    tracker = Tracker()
+    planner = _FileBackedSavePlanner(optimizers=[tracker])
+    planner.set_up_planner({"first": torch.ones(4), "second": torch.full((4,), 2.0)}, is_coordinator=True)
+    plan = planner.create_local_plan()
+    assert len(plan.items) == 2
+    first = planner.resolve_data(plan.items[0])
+    assert not tracker.consumed
+    planner.resolve_data(plan.items[1])
+    assert len(tracker.consumed) == 1
+    assert tracker.consumed[0] is first
+    torch.testing.assert_close(tracker.consumed[0], first, rtol=0, atol=0)
 
 
 def _layout_worker(rank, world, directory, rendezvous):
@@ -105,6 +153,28 @@ def _layout_worker(rank, world, directory, rendezvous):
             local_dt = drop_extra_parallel_dim(loaded, submesh, 1 - source_dim)
             torch.testing.assert_close(local_dt.full_tensor(), ep_weight, rtol=0, atol=0)
 
+        # File-backed writes must also retain main's EP layout metadata.
+        class Tracker:
+            consumed = 0
+
+            def checkpoint_commit_tensor(self, _value):
+                self.consumed += 1
+
+        tracker = Tracker()
+        path = directory + "file_backed_planner"
+        source = wrap(0)
+        dcp.save(
+            {"model": {"weight": source}, "optimizer": {"exp_avg": source.clone()}},
+            checkpoint_id=path,
+            planner=_FileBackedSavePlanner(optimizers=[tracker]),
+        )
+        layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+        assert set(layouts) == {"model.weight", "optimizer.exp_avg"}
+        assert all(layout["expert_order"] == "canonical" for layout in layouts.values())
+        target = {"model": {"weight": wrap(1, empty=True)}}
+        dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
+        torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
+
         if world == 4:
             from veomni.distributed.parallel_plan import SpecInfo
 
@@ -149,11 +219,33 @@ def _layout_worker(rank, world, directory, rendezvous):
         # verified declaration; unknown source and optimizer restore stay closed.
         path = directory + "known_legacy_model_only"
         bf16_bias = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
-        dcp.save({"model": {"layer.experts.weight": wrap(1), "layer.bias": bf16_bias}}, checkpoint_id=path)
-        model = torch.nn.Module()
-        model.layer = torch.nn.Module()
-        model.layer.experts = torch.nn.Module()
-        model.layer.experts.weight = torch.nn.Parameter(torch.zeros_like(global_weight))
+        gdn_a = torch.tensor([0.12345679], dtype=torch.float32)
+        gdn_dt = torch.tensor([-0.07456543], dtype=torch.float32)
+        dcp.save(
+            {
+                "model": {
+                    "layer.experts.weight": wrap(1),
+                    "layer.bias": bf16_bias,
+                    "layers.0.linear_attn.A_log": gdn_a,
+                    "layers.0.linear_attn.dt_bias": gdn_dt,
+                }
+            },
+            checkpoint_id=path,
+        )
+
+        def make_qwen_target():
+            target = torch.nn.Module()
+            target.config = SimpleNamespace(model_type="qwen4_exp")
+            target.layer = torch.nn.Module()
+            target.layer.experts = torch.nn.Module()
+            target.layer.experts.weight = torch.nn.Parameter(torch.zeros_like(global_weight))
+            target.layers = torch.nn.ModuleList([torch.nn.Module()])
+            target.layers[0].linear_attn = torch.nn.Module()
+            target.layers[0].linear_attn.A_log = torch.nn.Parameter(torch.zeros_like(gdn_a))
+            target.layers[0].linear_attn.dt_bias = torch.nn.Parameter(torch.zeros_like(gdn_dt))
+            return target
+
+        model = make_qwen_target()
         parallel = SimpleNamespace(dp_mode="ddp")
         with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
             DistributedCheckpointer.load(path, {"model": model}, parallel_state=parallel)
@@ -173,6 +265,8 @@ def _layout_worker(rank, world, directory, rendezvous):
             legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
         )
         torch.testing.assert_close(model.layer.experts.weight, global_weight, rtol=0, atol=0)
+        torch.testing.assert_close(model.layers[0].linear_attn.A_log, gdn_a, rtol=0, atol=0)
+        torch.testing.assert_close(model.layers[0].linear_attn.dt_bias, gdn_dt, rtol=0, atol=0)
         if rank == 0:
             import subprocess
             import sys
@@ -205,6 +299,7 @@ def _layout_worker(rank, world, directory, rendezvous):
                     "veomni_tp1_ep0_fsdp1",
                     "--save-dtype",
                     "preserve",
+                    "--qwen4-gdn-fp32",
                 ],
                 check=True,
                 timeout=60,
@@ -214,7 +309,80 @@ def _layout_worker(rank, world, directory, rendezvous):
             torch.testing.assert_close(exported["layer.bias"], bf16_bias, rtol=0, atol=0)
             assert exported["layer.experts.weight"].dtype == torch.float32
             assert exported["layer.bias"].dtype == torch.bfloat16
+            torch.testing.assert_close(exported["layers.0.linear_attn.A_log"], gdn_a, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layers.0.linear_attn.dt_bias"], gdn_dt, rtol=0, atol=0)
+            assert exported["layers.0.linear_attn.A_log"].dtype == torch.float32
+            assert exported["layers.0.linear_attn.dt_bias"].dtype == torch.float32
+            bf16_cli_dir = directory + "known_legacy_hf_bf16"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/merge_dcp_to_hf.py",
+                    "--load-dir",
+                    path,
+                    "--save-dir",
+                    bf16_cli_dir,
+                    "--mode",
+                    "full",
+                    "--legacy-expert-source-layout",
+                    "veomni_tp1_ep0_fsdp1",
+                    "--save-dtype",
+                    "bfloat16",
+                    "--qwen4-gdn-fp32",
+                ],
+                check=True,
+                timeout=60,
+            )
+            exported = load_file(bf16_cli_dir + "/model.safetensors")
+            torch.testing.assert_close(exported["layers.0.linear_attn.A_log"], gdn_a, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layers.0.linear_attn.dt_bias"], gdn_dt, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layer.experts.weight"], global_weight.bfloat16(), rtol=0, atol=0)
+            assert exported["layers.0.linear_attn.A_log"].dtype == torch.float32
+            assert exported["layers.0.linear_attn.dt_bias"].dtype == torch.float32
+            assert exported["layer.experts.weight"].dtype == torch.bfloat16
         dist.barrier()
+
+        # A trusted legacy expert declaration must not waive GDN precision.
+        path = directory + "known_legacy_bf16_gdn"
+        dcp.save(
+            {
+                "model": {
+                    "layer.experts.weight": wrap(1),
+                    "layers.0.linear_attn.A_log": gdn_a.bfloat16(),
+                    "layers.0.linear_attn.dt_bias": gdn_dt,
+                }
+            },
+            checkpoint_id=path,
+        )
+        target = {
+            "model": {
+                "layer.experts.weight": wrap(1, empty=True),
+                "layers.0.linear_attn.A_log": torch.zeros_like(gdn_a),
+                "layers.0.linear_attn.dt_bias": torch.zeros_like(gdn_dt),
+            }
+        }
+        with pytest.raises(dcp.CheckpointException, match="Qwen4 GDN parameter"):
+            dcp.load(
+                target,
+                checkpoint_id=path,
+                planner=_ModelStrictLoadPlanner(
+                    strict_model=True,
+                    strict_gdn_fp32=True,
+                    legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
+                ),
+            )
+        assert target["model"]["layer.experts.weight"].to_local().count_nonzero() == 0
+        assert target["model"]["layers.0.linear_attn.A_log"].count_nonzero() == 0
+        assert target["model"]["layers.0.linear_attn.dt_bias"].count_nonzero() == 0
+        model = make_qwen_target()
+        with pytest.raises(dcp.CheckpointException, match="Qwen4 GDN parameter"):
+            DistributedCheckpointer.load(
+                path,
+                {"model": model},
+                parallel_state=parallel,
+                legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
+            )
+        assert all(param.count_nonzero() == 0 for param in model.parameters())
 
         # Legacy metadata used two ordinary Shards, recording the wrong order.
         local = ep_weight.chunk(2, 0)[fsdp_rank].contiguous()
@@ -283,6 +451,8 @@ def test_expert_shard_layout_roundtrip_and_legacy_rejection(world, tmp_path):
 def test_unsupported_legacy_expert_source_layout_is_rejected():
     with pytest.raises(ValueError, match="Unsupported legacy expert source layout"):
         _ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="unverified")
+    with pytest.raises(TypeError, match="strict_gdn_fp32 must be a bool"):
+        _ModelStrictLoadPlanner(True, None, "veomni_tp1_ep0_fsdp1")
 
 
 def _non_ep_legacy_expert_bias_worker(rank, root, endpoint):
@@ -480,6 +650,62 @@ def _lora_export_worker(rank, world, shard_dim, directory, ep_dim, canonical, en
             torch.testing.assert_close(value, expected[name].to(value.dtype), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
+
+
+def _lora_noep_export_worker(rank, directory, fail_consolidation, endpoint):
+    from unittest.mock import patch
+
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.lora.state_dict import load_adapter_state_dict, strip_adapter_name
+    from veomni.utils import save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        parallel_state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        model = _lora_model()
+        expected = {}
+        for name, param in model.named_parameters():
+            if ".lora_" in name:
+                value = torch.arange(param.numel(), dtype=torch.float32).reshape(param.shape) / 256 + len(expected)
+                param.data.copy_(value)
+                expected[strip_adapter_name(name, "default")] = value.to(torch.bfloat16)
+        fully_shard(model, mesh=parallel_state.fsdp_mesh)
+        if fail_consolidation:
+            with patch.object(
+                save_safetensor_utils, "ckpt_to_state_dict", side_effect=OSError("injected export failure")
+            ):
+                expected_error = OSError if rank == 0 else RuntimeError
+                with pytest.raises(expected_error, match="injected export failure|failed on another rank"):
+                    save_safetensor_utils.save_lora_adapter_with_dcp(model, directory, parallel_state=parallel_state)
+            dist.barrier()
+        else:
+            original_load = save_safetensor_utils.ckpt_to_state_dict
+
+            def inspect_layout(*args, **kwargs):
+                reader = dcp.FileSystemReader(kwargs["save_checkpoint_path"])
+                layouts = reader.read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+                experts = {name: layout for name, layout in layouts.items() if ".experts." in name}
+                assert experts
+                assert all(layout["source_kind"] == "veomni_tp1_no_ep" for layout in experts.values())
+                return original_load(*args, **kwargs)
+
+            with patch.object(save_safetensor_utils, "ckpt_to_state_dict", side_effect=inspect_layout):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory, parallel_state=parallel_state)
+            exported = load_adapter_state_dict(directory)
+            assert exported.keys() == expected.keys()
+            for name in expected:
+                torch.testing.assert_close(exported[name], expected[name], rtol=0, atol=0)
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("fail_consolidation", [False, True])
+def test_noep_fsdp_lora_export_preserves_expert_layout(tmp_path, fail_consolidation):
+    spawn_with_rendezvous(_lora_noep_export_worker, args=(str(tmp_path), fail_consolidation), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
