@@ -172,8 +172,32 @@ def _layout_worker(rank, world, directory, rendezvous):
         dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
         torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
 
-        # An unversioned row-sharded source can have identical chunks to a
-        # misordered composite TP+EP source. Require source layout evidence.
+        if world == 4:
+            from veomni.distributed.parallel_plan import SpecInfo
+
+            def model_for(values):
+                model = torch.nn.Module()
+                # FSDP2 allocates the shard storage independently.  A plain
+                # contiguous slice may retain a nonzero offset into ``values``.
+                local = values.chunk(2, 0)[fsdp_rank].clone()
+                model.register_parameter("weight", torch.nn.Parameter(DTensor.from_local(local, submesh, [Shard(0)])))
+                model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(0), "weight", mesh, fsdp_shard_dim=0)}
+                return model
+
+            parallel = SimpleNamespace(
+                dp_mode="fsdp2", extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh}
+            )
+            source = model_for(ep_weight)
+            for save_async in (False, True):
+                path = directory + f"prepared-high-level-{save_async}"
+                DistributedCheckpointer.save(path, {"model": source}, save_async=save_async, parallel_state=parallel)
+                DistributedCheckpointer.wait_for_pending_save()
+                target = model_for(torch.zeros_like(ep_weight))
+                DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
+                torch.testing.assert_close(target.weight.to_local(), source.weight.to_local(), rtol=0, atol=0)
+
+        # Unversioned chunks may be indistinguishable from a misordered
+        # composite TP+EP source, so require independent source evidence.
         path = directory + "legacy_rows"
         dcp.save({"model": {"weight": wrap(1)}}, checkpoint_id=path)
         for target_dim in (0, 1):
