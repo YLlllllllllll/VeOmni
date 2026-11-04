@@ -29,6 +29,15 @@
     ]
   },
   {
+    "name": "dpo-pair-normalization-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_dpo_pair_mean.py"
+    ]
+  },
+  {
     "name": "qwen38-sft-resume-modes-unit",
     "suite": "unit",
     "args": [
