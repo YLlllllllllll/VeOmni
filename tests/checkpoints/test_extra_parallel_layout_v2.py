@@ -23,6 +23,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     _export_extra_parallel_layout_key,
     _extra_parallel_first_mesh,
     _extra_parallel_layout_key,
+    _ExtraParallelSavePlanner,
     _from_local_preserve_device,
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
@@ -443,13 +444,17 @@ def test_canonical_layout_rejects_mixed_legacy_shards():
 
 @pytest.mark.parametrize("shard_size", [None, 16])
 def test_v2_offline_hf_export_preserves_names_and_values(tmp_path, shard_size):
+    from veomni.distributed.parallel_state import ParallelState
+
     marker = _extra_parallel_layout_key({})
     source = {
         "model.layer.experts.weight": torch.arange(16, dtype=torch.float32).reshape(4, 4),
         "model.layer.other.weight": torch.arange(4, dtype=torch.bfloat16),
     }
     dcp.save(
-        {"model": {marker: "ep-outer-v1", **{marker + "__" + k: v for k, v in source.items()}}}, checkpoint_id=tmp_path
+        {"model": {marker: "ep-outer-v1", **{marker + "__" + k: v for k, v in source.items()}}},
+        checkpoint_id=tmp_path,
+        planner=_ExtraParallelSavePlanner(parallel_state=ParallelState(device_type="cpu")),
     )
     plan, _, _ = _get_sharding_plan(str(tmp_path), shard_size=shard_size)
     actual = {}
@@ -458,6 +463,85 @@ def test_v2_offline_hf_export_preserves_names_and_values(tmp_path, shard_size):
     assert actual.keys() == source.keys()
     for key, value in source.items():
         torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["model", "optimizer", "proven_model", "proven_optimizer"])
+@pytest.mark.parametrize("action", ["save", "load"])
+@pytest.mark.parametrize("mutation", ["replace", "inplace"])
+def test_checkpoint_adapter_rejects_stale_parallel_specs(kind, action, mutation):
+    from veomni.checkpoint.dcp_checkpointer import _ProvenModelState, _ProvenMultiOptimizerState
+
+    model = torch.nn.Linear(2, 2)
+    model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(0), "weight", SimpleNamespace(shape=(1, 1)), 0)}
+    parallel = SimpleNamespace(dp_mode="fsdp2")
+    optimizer = object()
+    if kind == "model":
+        adapter = ModelState(model, parallel_state=parallel)
+    elif kind == "optimizer":
+        adapter = OptimizerState(model, optimizer, parallel_state=parallel)
+    elif kind == "proven_model":
+        adapter = _ProvenModelState(model, optimizer=optimizer, group=None, parallel_state=parallel)
+    else:
+        adapter = _ProvenMultiOptimizerState(
+            model, optimizer, parallel_state=parallel, generation="g", expected_layout="l", group=None
+        )
+    if mutation == "replace":
+        model._fqn2spec_info = dict(model._fqn2spec_info)
+    else:
+        model._fqn2spec_info["weight"].fsdp_shard_dim = 1
+    with pytest.raises(RuntimeError, match="layout changed while checkpoint adapter"):
+        adapter.state_dict() if action == "save" else adapter.load_state_dict({})
+
+
+def _asymmetric_stale_adapter_worker(rank, kind, action, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import veomni.checkpoint.dcp_checkpointer as checkpoint_module
+    from veomni.checkpoint.dcp_checkpointer import _ProvenModelState, _ProvenMultiOptimizerState
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = torch.nn.Linear(2, 2)
+        model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(0), "weight", SimpleNamespace(shape=(1, 1)), 0)}
+        parallel = SimpleNamespace(dp_mode="fsdp2")
+        calls = []
+
+        def should_not_enter(*args, **kwargs):
+            calls.append(True)
+            dist.barrier()
+            return {}
+
+        optimizer = SimpleNamespace(_sparse_state_dict=should_not_enter, _dcp_load_state_dict=should_not_enter)
+        if kind == "model":
+            adapter = _ProvenModelState(model, optimizer=optimizer, group=None, parallel_state=parallel)
+        else:
+            adapter = _ProvenMultiOptimizerState(
+                model, optimizer, parallel_state=parallel, generation="g", expected_layout="l", group=None
+            )
+        if rank == 0:
+            model._fqn2spec_info = dict(model._fqn2spec_info)
+        with (
+            patch.object(checkpoint_module, "get_model_state_dict", side_effect=should_not_enter),
+            patch.object(checkpoint_module, "set_model_state_dict", side_effect=should_not_enter),
+            pytest.raises(RuntimeError, match="layout changed|validating checkpoint adapter layout"),
+        ):
+            adapter.state_dict() if action == "save" else adapter.load_state_dict({})
+        assert not calls
+        value = torch.tensor(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("kind", ["model", "optimizer"])
+@pytest.mark.parametrize("action", ["save", "load"])
+def test_asymmetric_stale_adapter_is_rejected_on_all_ranks(kind, action):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_asymmetric_stale_adapter_worker, args=(kind, action), nprocs=2)
 
 
 def test_hf_export_rejects_duplicate_legacy_and_canonical_source(tmp_path):

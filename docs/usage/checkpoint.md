@@ -387,8 +387,9 @@ The versioned EP-outer tensor namespace is opt-in through
 EP-first shard coordinates and record per-tensor source layout. A versioned
 plan must retain the original `global_shape` and use FSDP DTensor parameters. Every
 non-persistent ExtraParallel shard in a checkpoint must use the canonical
-layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
-identifies canonical global values independently of source geometry, so DCP can
+layout: mixing legacy and canonical shards is rejected. For tensors with proven
+source layouts, the v2 namespace represents canonical global values independent
+of source geometry, so DCP can
 reshard a model checkpoint across supported FSDP shard axes. Use
 `DistributedCheckpointer` for save and resume: it rejects ambiguous unversioned
 expert layouts before copying model tensors unless the model-only source is
@@ -434,6 +435,11 @@ For CLI export, pass `--legacy-expert-source-layout veomni_tp1_ep0_fsdp1` to
 be rounded to BF16; the CLI retains its historical BF16 export default. This
 preserves tensor dtypes on disk; consumers must configure their loader to avoid
 subsequently casting the FP32 tensors.
+
+The namespace marker alone does not prove that an ordinary or shared expert's
+replicas were synchronized. Older v2 checkpoints whose planner metadata omits
+an expert's source layout are rejected on resume and export; verify and migrate
+them from their original training layout before use.
 
 The standard, non-v2 writer uses canonical EP-first coordinates for same-axis
 EP/FSDP shards and records source expert layouts in DCP planner metadata.
