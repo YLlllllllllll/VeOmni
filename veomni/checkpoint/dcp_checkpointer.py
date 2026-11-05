@@ -2357,6 +2357,9 @@ class DistributedCheckpointer(CheckpointerBase):
     # first, which is what draining before each save used to do.
     _save_futures: Dict[str, Any] = {}
     _async_process_groups: Dict[str, Any] = {}
+    # Async slots are shared by model managers. A failure poisons this
+    # process so another manager cannot certify a missing checkpoint.
+    _async_save_failed = False
     # The gloo group a staged save's own collectives run on, created on first use.
     _stage_process_group: Optional[Any] = None
     # Both group caches live as long as the process: a run initialises distributed
@@ -2433,6 +2436,8 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             None
         """
+        if cls._async_save_failed:
+            raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
         if not isinstance(state, dict) or "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
         optimizer = state.get("optimizer")
@@ -2780,18 +2785,20 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             state: state loaded
         """
-        if isinstance(state, dict):
-            state.pop("_veomni_optimizer_identity_verified", None)
-            state.pop("_veomni_optimizer_checkpoint_generation", None)
-        if not isinstance(state, dict) or "model" not in state:
-            if state is None:
-                raise ValueError("State dict must be provided to load a distributed checkpoint.")
-            raise ValueError("Model must be provided to load a distributed checkpoint.")
+        error = None
+        if state is None:
+            error = ValueError("State dict must be provided to load a distributed checkpoint.")
+        elif not isinstance(state, dict) or "model" not in state:
+            error = ValueError("Model must be provided to load a distributed checkpoint.")
+        raise_if_any_rank_failed(error, "checking checkpoint load state", group=process_group)
+        state.pop("_veomni_optimizer_identity_verified", None)
+        state.pop("_veomni_optimizer_checkpoint_generation", None)
         optimizer = state.get("optimizer")
         multi = getattr(optimizer, "_is_multi_optimizer", False) is True
-        single_exact = not multi and _requires_rank_local_optimizer_checkpoint(optimizer)
-        if single_exact:
-            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+        error = None
+        if not multi and _requires_rank_local_optimizer_checkpoint(optimizer):
+            error = RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+        raise_if_any_rank_failed(error, "checking optimizer precision policy", group=process_group)
         _reject_unproven_extra_parallel_optimizer(
             state, parallel_state, group=process_group, trainable_only=trainable_only, allow_proven_optimizer=multi
         )
@@ -2808,14 +2815,38 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=process_group,
             )
 
-        wants_optimizer = state.get("optimizer") is not None
+        wants_optimizer, fused_dir, model_state, optimizer_state, model_reader, optimizer_reader, error = (
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        try:
+            wants_optimizer = state.get("optimizer") is not None
+            fused_dir = cls._legacy_fused_dir(path, module)
+            model_state = _model_state()
+            optimizer_state = _optimizer_state() if wants_optimizer else None
+            model_reader = cls._create_storage_reader(fused_dir or weights_dir(path, module))
+            if wants_optimizer and fused_dir is None:
+                optimizer_reader = cls._create_storage_reader(optimizer_dir(path, module))
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing distributed checkpoint load", group=process_group)
+        if dist.is_initialized():
+            decisions = [None] * dist.get_world_size(group=process_group)
+            local = (fused_dir, wants_optimizer, multi)
+            dist.all_gather_object(decisions, local, group=process_group)
+            if any(decision != local for decision in decisions):
+                raise RuntimeError("Checkpoint load format differs across ranks")
 
-        fused_dir, error = None, None
+        error = None
         try:
             _validate_legacy_expert_source_layout(legacy_expert_source_layout)
             if legacy_expert_source_layout is not None and optimizer is not None:
                 raise ValueError("Legacy expert source declarations are only supported for model-only loads")
-            fused_dir = cls._legacy_fused_dir(path, module)
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "inspecting checkpoint layout", group=process_group)
@@ -2956,24 +2987,6 @@ class DistributedCheckpointer(CheckpointerBase):
             state["_veomni_optimizer_identity_verified"] = True
             state["_veomni_optimizer_checkpoint_generation"] = generation
             return state
-        model_state, optimizer_state, model_reader, reader, error = None, None, None, None, None
-        try:
-            model_state = _model_state()
-            optimizer_state = _optimizer_state() if wants_optimizer else None
-            model_reader = cls._create_storage_reader(fused_dir or weights_dir(path, module))
-            if wants_optimizer:
-                reader = (
-                    model_reader if fused_dir is not None else cls._create_storage_reader(optimizer_dir(path, module))
-                )
-        except BaseException as exc:
-            error = exc
-        raise_if_any_rank_failed(error, "preparing distributed checkpoint load", group=process_group)
-        if dist.is_initialized():
-            decisions = [None] * dist.get_world_size(group=process_group)
-            local = (fused_dir, wants_optimizer, multi)
-            dist.all_gather_object(decisions, local, group=process_group)
-            if any(decision != local for decision in decisions):
-                raise RuntimeError("Checkpoint load format differs across ranks")
 
         def prepared(owner, description):
             snapshot, error = None, None
@@ -2983,6 +2996,8 @@ class DistributedCheckpointer(CheckpointerBase):
                 error = exc
             raise_if_any_rank_failed(error, description, group=process_group)
             return _PreparedLoadState(owner, snapshot, process_group)
+
+        reader = model_reader if fused_dir is not None else optimizer_reader
 
         def load_extra_coordinated(checkpoint_dir):
             error = None
@@ -3091,6 +3106,8 @@ class DistributedCheckpointer(CheckpointerBase):
         leaving the remaining slots running and their futures unreachable.
         """
         if not cls._save_futures:
+            if cls._async_save_failed:
+                raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
         futures = cls._save_futures
@@ -3110,10 +3127,16 @@ class DistributedCheckpointer(CheckpointerBase):
         # that owned that group has stopped issuing collectives on it. The lookup
         # misses only when the save ran without a process group at all, in a
         # single process, where the reduction is a no-op anyway.
-        for slot in futures:
-            raise_if_any_rank_failed(
-                errors.get(slot), f"a pending async DCP save ({slot})", group=cls._async_process_groups.get(slot)
-            )
+        try:
+            for slot in futures:
+                raise_if_any_rank_failed(
+                    errors.get(slot), f"a pending async DCP save ({slot})", group=cls._async_process_groups.get(slot)
+                )
+        except BaseException:
+            cls._async_save_failed = True
+            raise
+        if cls._async_save_failed:
+            raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
 
     @classmethod
     def _drain_slot(cls, slot: str) -> None:
@@ -3142,9 +3165,13 @@ class DistributedCheckpointer(CheckpointerBase):
         except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {rank}] previous async DCP save ({slot}) raised; propagating", exc_info=True)
             error = e
-        raise_if_any_rank_failed(
-            error, f"the previous async DCP save ({slot})", group=cls._async_process_groups.get(slot)
-        )
+        try:
+            raise_if_any_rank_failed(
+                error, f"the previous async DCP save ({slot})", group=cls._async_process_groups.get(slot)
+            )
+        except BaseException:
+            cls._async_save_failed = True
+            raise
 
     @classmethod
     def _get_stage_process_group(cls, timeout_seconds: Optional[int]) -> Optional[Any]:
@@ -3182,6 +3209,8 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
+        if cls._async_save_failed:
+            raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
         file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
         if file_optimizers is not None and save_async:
             raise RuntimeError("File-backed optimizer state requires synchronous DCP save")

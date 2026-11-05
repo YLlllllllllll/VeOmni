@@ -514,7 +514,15 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
             return original(path)
 
         DistributedCheckpointer._create_storage_reader = classmethod(reader)
-        with pytest.raises((RuntimeError, OSError), match="inventory reader"):
+        expected = (
+            (OSError, "injected inventory reader failure")
+            if rank == 1
+            else (
+                RuntimeError,
+                "reading MultiOptimizer scheduler checkpoint failed on another rank",
+            )
+        )
+        with pytest.raises(expected[0], match=expected[1]):
             DistributedCheckpointer.load(
                 checkpoint,
                 {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
