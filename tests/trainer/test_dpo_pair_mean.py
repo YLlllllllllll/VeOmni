@@ -205,6 +205,16 @@ def test_reward_accuracy_is_pair_weighted_not_microbatch_weighted(monkeypatch):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_legacy_tuple_microbatches_preserve_pair_mean(monkeypatch):
+    state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0)
+    trainer, metrics = _build_trainer(state, distributed=False, monkeypatch=monkeypatch)
+    trainer.train_step(iter([(_microbatch([1]), _microbatch([3, 3, 3]))]))
+    expected_loss, expected_grad, _ = _expected([1, 3, 3, 3])
+    torch.testing.assert_close(trainer.policy_model.optimizer.gradient, expected_grad)
+    assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-7)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("accepts_kwargs", [False, True])
 def test_legacy_backward_override_fails_before_optimizer(monkeypatch, accepts_kwargs):
     state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0)
@@ -532,6 +542,8 @@ def _provenance_callback_mutation_worker(rank, scenario, endpoint):
                     micro_batches[0].pop(dpo.DPO_APPROVED_KEY)
                 elif scenario == "weight":
                     micro_batches[0]["loss_weights"] = torch.ones_like(micro_batches[0]["labels"], dtype=torch.float32)
+                elif scenario == "none":
+                    micro_batches[0] = None
                 else:
                     micro_batches.clear()
 
@@ -548,7 +560,7 @@ def _provenance_callback_mutation_worker(rank, scenario, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("scenario", ["padding", "proof", "count", "weight"])
+@pytest.mark.parametrize("scenario", ["padding", "proof", "count", "weight", "none"])
 def test_provenance_callback_mutation_fails_on_all_ranks(scenario):
     spawn_with_rendezvous(_provenance_callback_mutation_worker, args=(scenario,), nprocs=2)
 

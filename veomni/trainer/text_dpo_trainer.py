@@ -164,8 +164,11 @@ def _dpo_pair_weighting(
                 raise ValueError(
                     "DPO forward_backward_step overrides must accept pair_normalization and apply it to the pair-loss sum"
                 ) from exc
-        if not isinstance(micro_batches, list) or not micro_batches:
-            raise ValueError("DPO optimizer step requires a nonempty list of microbatches")
+        allowed_tuple = not provenance_enabled and isinstance(micro_batches, tuple)
+        if (not isinstance(micro_batches, list) and not allowed_tuple) or not micro_batches:
+            raise ValueError(
+                "DPO optimizer step requires nonempty microbatches with the expected provenance structure"
+            )
         vocabulary = vocab_size() if vocab_size is not None else None
         if vocabulary is not None and (type(vocabulary) is not int or vocabulary <= 0):
             raise ValueError("DPO model vocabulary size must be a positive integer")
