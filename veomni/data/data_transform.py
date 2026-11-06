@@ -667,8 +667,8 @@ def _process_sample_qwen_vl_base(
     **kwargs,
 ):
     """Prepare Qwen-VL media and conversations while preserving supervision."""
-    from .multimodal import conv_preprocess
     from .multimodal.image_utils import fetch_images
+    from .multimodal.preprocess import conv_preprocess_qwen_vl as conv_preprocess
     from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
@@ -698,8 +698,7 @@ def _process_sample_qwen_vl_base(
     else:
         conversations = sample
     if source != "openai_chatml":
-        preprocess_kwargs = {**kwargs, "preserve_loss_supervision": True}
-        conversations = conv_preprocess(source, conversations, **preprocess_kwargs)
+        conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
