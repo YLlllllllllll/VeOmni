@@ -252,7 +252,8 @@ def test_symlink_shard_still_loads_and_skips_advice(tmp_path):
 
 @pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
 @pytest.mark.parametrize("evict", [False, True])
-def test_multi_optimizer_restore_and_next_update_with_cache_advice(tmp_path, monkeypatch, evict):
+@pytest.mark.parametrize("positional", [False, True])
+def test_multi_optimizer_restore_and_next_update_with_cache_advice(tmp_path, monkeypatch, evict, positional):
     from types import SimpleNamespace
 
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -282,7 +283,10 @@ def test_multi_optimizer_restore_and_next_update_with_cache_advice(tmp_path, mon
     calls = []
     monkeypatch.setattr(os, "posix_fadvise", lambda fd, *args: calls.append(os.readlink(f"/proc/self/fd/{fd}")))
     state = {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}
-    DistributedCheckpointer.load(checkpoint, state, parallel_state=parallel, evict_source_cache=evict)
+    if positional:
+        DistributedCheckpointer.load(checkpoint, state, None, "", False, parallel, None, evict)
+    else:
+        DistributedCheckpointer.load(checkpoint, state, parallel_state=parallel, evict_source_cache=evict)
     assert state["_veomni_optimizer_identity_verified"] is True
     if evict:
         assert any("/ckpt/" in path for path in calls)

@@ -62,6 +62,16 @@ def _assert_close_across_devices(left, right, path="root"):
         assert left == right
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cross_device_comparison_rejects_precision_or_dtype_regressions():
+    reference = {"tensor": torch.tensor([1.0, 2.0], dtype=torch.float32)}
+    _assert_close_across_devices(reference, {"tensor": reference["tensor"].clone()})
+    with pytest.raises(AssertionError):
+        _assert_close_across_devices(reference, {"tensor": torch.tensor([1.0, 2.001])})
+    with pytest.raises(AssertionError):
+        _assert_close_across_devices(reference, {"tensor": reference["tensor"].double()})
+
+
 def _assert_ep2_checkpoint_layout(checkpoint_dir):
     weights = FileSystemReader(weights_dir(str(checkpoint_dir))).read_metadata().state_dict_metadata
     for name, shape in (
