@@ -638,6 +638,20 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
                 if key in layouts and layouts[key] != value:
                     raise RuntimeError(f"Checkpoint tensor {key!r} has inconsistent source layouts across ranks")
                 layouts[key] = value
+        has_v2_model = any(
+            key.startswith("model.") and _is_extra_parallel_layout_marker(key.split(".")[-1])
+            for key in metadata.state_dict_metadata
+        )
+        if has_v2_model:
+            unproven = sorted(
+                key
+                for key, value in layouts.items()
+                if key.startswith("model.") and value.get("expert_order") != "canonical"
+            )
+            if unproven:
+                raise RuntimeError(
+                    f"Cannot save canonical ExtraParallel checkpoint with unproven expert layout: {unproven[0]}"
+                )
         metadata.planner_data = {
             **(metadata.planner_data or {}),
             _EXPERT_LAYOUTS_KEY: {"version": 1, "tensors": layouts},

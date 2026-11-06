@@ -441,6 +441,8 @@ The namespace marker alone does not prove that an ordinary or shared expert's
 replicas were synchronized. Older v2 checkpoints whose planner metadata omits
 an expert's source layout are rejected on resume and export; verify and migrate
 them from their original training layout before use.
+New v2 saves also reject expert layouts marked as unproven before publishing
+DCP metadata.
 
 The standard, non-v2 writer uses canonical EP-first coordinates for same-axis
 EP/FSDP shards and records source expert layouts in DCP planner metadata.
