@@ -507,6 +507,18 @@ def parallelize_model_fsdp2(
         if not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2":
             raise ValueError("FP32 expert weight gradients require FSDP2")
 
+    expert_fp32_wgrad = mixed_precision.npu_expert_fp32_wgrad
+    if expert_fp32_wgrad:
+        if not IS_NPU_AVAILABLE or get_device_type() != "npu":
+            raise ValueError("FP32 expert weight gradients require an NPU")
+        from .npu_moe_precision import validate_qwen4_experts
+
+        expert_ids = validate_qwen4_experts(model)
+        basic_modules = list(_fsdp_target_classes(model, basic_modules, True))
+    else:
+        expert_ids = set()
+    wrapped_expert_ids = set()
+
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
 
@@ -538,18 +550,8 @@ def parallelize_model_fsdp2(
         raise RuntimeError("Qwen4-Exp config declares no GDN layers but GDN modules are present")
     if keep_qwen4_gdn_fp32 and compile_config is not None and compile_config.enable:
         raise NotImplementedError("Qwen4 FP32 GDN parameter groups are not yet qualified with torch.compile")
-    expert_fp32_wgrad = mixed_precision.npu_expert_fp32_wgrad
-    if expert_fp32_wgrad:
-        if not IS_NPU_AVAILABLE or get_device_type() != "npu":
-            raise ValueError("FP32 expert weight gradients require an NPU")
-        from .npu_moe_precision import validate_qwen4_experts
-
-        expert_ids = validate_qwen4_experts(model)
-    else:
-        expert_ids = set()
-    wrapped_expert_ids = set()
-
-    target_classes = _fsdp_target_classes(model, basic_modules, expert_fp32_wgrad)
+    model_no_split_modules = getattr(model, "_no_split_modules", None) or []
+    target_classes = set(model_no_split_modules) | set(basic_modules or [])
     if keep_qwen4_gdn_fp32:
         # The VLM wrapper may name a different decoder class than the text stack.
         target_classes.add("Qwen4ExpTextDecoderLayer")
@@ -967,9 +969,6 @@ def parallelize_model_fsdp2(
 
     if wrapped_gdn_ids != expected_gdn_ids:
         raise RuntimeError("Not every Qwen4 GDN was assigned to an FP32 FSDP group")
-    if expert_fp32_wgrad and wrapped_expert_ids != expert_ids:
-        raise RuntimeError("Not every Qwen4-Exp expert was wrapped for FP32 weight gradients")
-
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
     # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
     # This keeps the root's params (lm_head + embeddings + final norm)
@@ -979,6 +978,8 @@ def parallelize_model_fsdp2(
     # `setStorage … storage of size 0` when the saved reference points
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
+    if expert_fp32_wgrad and wrapped_expert_ids != expert_ids:
+        raise RuntimeError("Not every Qwen4-Exp expert was wrapped for FP32 weight gradients")
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
