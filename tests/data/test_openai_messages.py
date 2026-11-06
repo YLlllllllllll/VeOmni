@@ -394,7 +394,8 @@ def test_fractional_weight_is_not_silently_dropped():
     sample = {"messages": [{"role": "assistant", "content": "answer", "loss_weight": 0.25}]}
     messages, _ = normalize_openai_messages(sample)
     weighted = template.text_template.encode_messages(sample["messages"])
-    if "loss_weights" in weighted:
+    if getattr(template.text_template, "supports_loss_weights", False):
+        assert "loss_weights" in weighted
         assert (template.encode_messages(messages)["loss_weights"] == 0.25).all()
     else:
         with pytest.raises(ValueError, match="weighted ChatML"):
@@ -421,9 +422,10 @@ def test_masked_and_active_fractional_weights_with_weighted_renderer():
             {"role": "assistant", "content": "trained", "loss_mask": 1, "loss_weight": 0.25},
         ]
     }
-    expected = ChatmlTemplate(tokenizer).encode_messages(sample["messages"])
-    if "loss_weights" not in expected:
+    if not getattr(ChatmlTemplate, "supports_loss_weights", False):
         pytest.skip("requires the independent weighted-loss feature")
+    expected = ChatmlTemplate(tokenizer).encode_messages(sample["messages"])
+    assert "loss_weights" in expected
     vision = SimpleNamespace(
         tokenizer=tokenizer, image_token_id=1000, video_token_id=1001, image_pattern=lambda count: "I" * count
     )
@@ -447,8 +449,9 @@ def test_weighted_text_image_mixed_packing(monkeypatch):
 
     tokenizer = _ToyTokenizer()
     assistant = {"role": "assistant", "content": "answer", "loss_weight": 0.25}
-    if "loss_weights" not in ChatmlTemplate(tokenizer).encode_messages([assistant]):
+    if not getattr(ChatmlTemplate, "supports_loss_weights", False):
         pytest.skip("requires the independent weighted-loss feature")
+    assert "loss_weights" in ChatmlTemplate(tokenizer).encode_messages([assistant])
 
     class ImageProcessor:
         merge_size = 2
