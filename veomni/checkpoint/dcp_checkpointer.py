@@ -3278,11 +3278,12 @@ class DistributedCheckpointer(CheckpointerBase):
         """
         if cls._async_save_failed:
             raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
-        file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
-        if file_optimizers is not None and save_async:
-            raise RuntimeError("File-backed optimizer state requires synchronous DCP save")
         planner, error = None, None
+        file_optimizers = None
         try:
+            file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
+            if file_optimizers is not None and save_async:
+                raise RuntimeError("File-backed optimizer state requires synchronous DCP save")
             optimizer_adapter = save_state.get("optimizer")
             planner_kwargs = dict(
                 dedup_save_to_lowest_rank=save_to_lowest_rank,

@@ -128,6 +128,28 @@ def _layout_worker(rank, world, directory, rendezvous):
             local_dt = DTensor.from_local(local, submesh, placement)
             return restore_extra_parallel_dim(local_dt, mesh, submesh, 0, dim)
 
+        # File-backed writes must also retain main's EP layout metadata.
+        class Tracker:
+            consumed = 0
+
+            def checkpoint_commit_tensor(self, _value):
+                self.consumed += 1
+
+        tracker = Tracker()
+        path = directory + "file_backed_planner"
+        source = wrap(0)
+        dcp.save(
+            {"model": {"weight": source}, "optimizer": {"exp_avg": source.clone()}},
+            checkpoint_id=path,
+            planner=_FileBackedSavePlanner(optimizers=[tracker]),
+        )
+        layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+        assert set(layouts) == {"model.weight", "optimizer.exp_avg"}
+        assert all(layout["expert_order"] == "canonical" for layout in layouts.values())
+        target = {"model": {"weight": wrap(1, empty=True)}}
+        dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
+        torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
+
         for source_dim in (0, 1):
             source = wrap(source_dim)
             torch.testing.assert_close(source.full_tensor(), global_weight, rtol=0, atol=0)
@@ -155,28 +177,6 @@ def _layout_worker(rank, world, directory, rendezvous):
             torch.testing.assert_close(loaded.full_tensor(), global_weight, rtol=0, atol=0)
             local_dt = drop_extra_parallel_dim(loaded, submesh, 1 - source_dim)
             torch.testing.assert_close(local_dt.full_tensor(), ep_weight, rtol=0, atol=0)
-
-        # File-backed writes must also retain main's EP layout metadata.
-        class Tracker:
-            consumed = 0
-
-            def checkpoint_commit_tensor(self, _value):
-                self.consumed += 1
-
-        tracker = Tracker()
-        path = directory + "file_backed_planner"
-        source = wrap(0)
-        dcp.save(
-            {"model": {"weight": source}, "optimizer": {"exp_avg": source.clone()}},
-            checkpoint_id=path,
-            planner=_FileBackedSavePlanner(optimizers=[tracker]),
-        )
-        layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
-        assert set(layouts) == {"model.weight", "optimizer.exp_avg"}
-        assert all(layout["expert_order"] == "canonical" for layout in layouts.values())
-        target = {"model": {"weight": wrap(1, empty=True)}}
-        dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
-        torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
 
         # An unversioned row-sharded source can have identical chunks to a
         # misordered composite TP+EP source. Require source layout evidence.
@@ -1224,9 +1224,15 @@ def _ple_ep1_lora_worker(rank, root, unproven, endpoint):
         base = model.base_model.model
         base.experts.bias = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
         base.ple = torch.nn.Embedding(8, 4)
+        # This adapter-only export exercises PLE layout, but does not export PLE weights.
+        base.ple.weight.requires_grad_(False)
         base.get_parallel_plan = lambda: ParallelPlan({"ple": {"ple.weight": Shard(0)}})
         plan = get_runtime_parallel_plan(model)
         model._fqn2spec_info = plan.apply(model, parallel.extra_parallel_fsdp_device_mesh)
+        assert not base.ple.weight.requires_grad
+        assert base.ple.weight.shape == (4, 4)
+        assert base.ple.weight.spec_info.para_name == "ple"
+        assert base.ple.weight.spec_info.placement == Shard(0)
         selected = get_lora_state_dict(model, config=model.get_lora_config())
         assert any("experts.bias" in name for name in selected)
         for name, param in list(model.named_parameters()):
@@ -1849,3 +1855,23 @@ def test_export_preflight_preserves_existing_hf_and_allows_filtered_lora(tmp_pat
     save_lora_adapter_weights(str(lora_output), str(lora_path), save_dtype=None)
     lora = load_file(str(lora_output / "adapter_model.safetensors"))
     torch.testing.assert_close(lora["base_model.model.proj.lora_A.default.weight"], torch.ones(2, 2), rtol=0, atol=0)
+
+
+def _file_backed_async_mismatch_worker(rank, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        writer = SimpleNamespace()
+        if rank == 0:
+            writer._veomni_file_optimizers = []
+        with pytest.raises(RuntimeError, match="synchronous DCP save|preparing the checkpoint save planner"):
+            DistributedCheckpointer.execute_save({}, writer, save_async=True)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_file_backed_async_mismatch_is_coordinated_before_save():
+    spawn_with_rendezvous(_file_backed_async_mismatch_worker, args=(), nprocs=2)
