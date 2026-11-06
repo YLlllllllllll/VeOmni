@@ -158,6 +158,28 @@ def test_dpo_main_collator_sp_enabled(monkeypatch):
     assert batch["input_ids"].view(-1).shape[0] == 4  # 8 tokens / sp_size=2
 
 
+@pytest.mark.parametrize("provenance", [False, True])
+def test_dpo_rejects_explicit_loss_weight_before_rendering(provenance):
+    messages = [{"role": "assistant", "content": "answer", "loss_weight": 0.25}]
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        process_dpo_example(
+            {"chosen": messages, "rejected": [{"role": "assistant", "content": "other"}]},
+            chat_template=_FakeChatTemplate(),
+            record_segment_provenance=provenance,
+        )
+
+
+def test_dpo_rejects_weights_returned_by_template():
+    class WeightedTemplate(_FakeChatTemplate):
+        def encode_messages(self, messages, max_seq_len=None):
+            result = super().encode_messages(messages, max_seq_len)
+            result["loss_weights"] = [0.25] * len(messages)
+            return result
+
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        process_dpo_example({"chosen": [10, 20], "rejected": [30, 40]}, chat_template=WeightedTemplate())
+
+
 @pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
 def test_dpo_rejects_weighted_input_without_silently_dropping_it(key):
     with pytest.raises(ValueError, match="does not support token loss_weights"):
