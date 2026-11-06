@@ -335,17 +335,6 @@ Checkpoints from older layouts have no manifest; discovery falls back to a
 only while the step is still entirely pre-split. See
 [Resuming older checkpoints](#resuming-older-checkpoints).
 
-When resuming a legacy Adam checkpoint into its original output directory, the
-trainer reuses an unchanged same-step checkpoint only after a successful model
-and optimizer load and validation of the completed manifest, RNG state and
-available data cursor. This follows the built-in synchronous trainer lifecycle,
-which does not replace the optimizer or checkpoint provider between loading and
-cursor validation.
-If those cannot be established, use a different output directory: this avoids
-overwriting the source checkpoint during an immediate epoch-end or HF export.
-This guard does not prove optimizer group identity or claim exact recovery for
-legacy optimizer formats.
-
 SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
 `ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half
 through the shared `GlobalStateCallback`, so its steps carry the same per-rank
@@ -383,6 +372,17 @@ save's own Gloo group so the ranks whose write finished first wait there
 rather than on the training backend.
 
 ## Resuming older checkpoints
+
+When resuming a legacy Adam checkpoint into its original output directory, the
+trainer reuses an unchanged same-step checkpoint only after a successful model
+and optimizer load and validation of the completed manifest, RNG state and
+available data cursor. This follows the built-in synchronous trainer lifecycle,
+which does not replace the optimizer or checkpoint provider between loading and
+cursor validation.
+If those cannot be established, use a different output directory: this avoids
+overwriting the source checkpoint during an immediate epoch-end or HF export.
+This guard does not prove optimizer group identity or claim exact recovery for
+legacy optimizer formats.
 
 Temporary. New saves never produce the older shapes, and the compatibility
 loader in `veomni/checkpoint/legacy_v0_1_12.py` will be removed. Current files
