@@ -1,5 +1,15 @@
 [
   {
+    "name": "npu-bounded-activation-offload-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_bounded_activation_offload.py"
+    ]
+  },
+  {
     "name": "device-api-scoped-exceptions-unit",
     "suite": "unit",
     "args": ["-v", "-s", "-x", "tests/special_sanity/test_device_api_usage.py"]

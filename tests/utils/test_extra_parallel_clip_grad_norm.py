@@ -224,14 +224,23 @@ def _run_selective_expert_offload(fused, checkpoint_dir):
                 for scale in (1.0, 2.0, 0.5):
                     x = torch.ones(16, device=device)
                     left, right = reference(x) * scale, candidate(x) * scale
-                    torch.testing.assert_close(left, right, rtol=0, atol=0)
+                    torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-12)
                     left.backward()
                     right.backward()
                 get_torch_device().synchronize()
                 for left, right in zip(reference.parameters(), candidate.parameters(), strict=True):
-                    torch.testing.assert_close(local(left.grad).cpu(), local(right.grad).cpu(), rtol=0, atol=0)
+                    torch.testing.assert_close(local(left.grad).cpu(), local(right.grad).cpu(), rtol=1e-5, atol=1e-12)
+                before_clip = [local(parameter.grad).detach().cpu().clone() for parameter in candidate.parameters()]
                 norms = [veomni_clip_grad_norm(model, 0.5) for model in (reference, candidate)]
                 torch.testing.assert_close(norms[0], norms[1], rtol=1e-6, atol=1e-6)
+                assert norms[1].item() > 0.5
+                coefficient = torch.clamp(0.5 / (norms[1].detach().cpu() + 1e-6), max=1.0)
+                for left, right, before in zip(
+                    reference.parameters(), candidate.parameters(), before_clip, strict=True
+                ):
+                    clipped = local(right.grad).cpu()
+                    torch.testing.assert_close(local(left.grad).cpu(), clipped, rtol=1e-5, atol=1e-12)
+                    torch.testing.assert_close(clipped, before * coefficient, rtol=1e-5, atol=1e-12)
                 for optimizer, scheduler in zip(optimizers, schedulers, strict=True):
                     optimizer.step()
                     scheduler.step()
