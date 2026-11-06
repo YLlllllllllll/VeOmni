@@ -490,6 +490,68 @@ def test_legacy_callback_can_replace_valid_batches_before_weighting(monkeypatch)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_legacy_callback_can_add_valid_batch_before_pair_weighting(monkeypatch):
+    state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0)
+    trainer, metrics = _build_trainer(state, distributed=False, monkeypatch=monkeypatch)
+    trainer.base.on_step_begin = lambda micro_batches, **kwargs: micro_batches.append(_microbatch([3]))
+    _run(trainer, [[1]], state)
+    expected_loss, expected_grad, _ = _expected([1, 3])
+    torch.testing.assert_close(trainer.policy_model.optimizer.gradient, expected_grad)
+    assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-7)
+
+
+def _provenance_callback_mutation_worker(rank, scenario, endpoint):
+    import veomni.data.data_collator as collator_module
+
+    class Tokenizer:
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "test-tokenizer-v1"
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(value) for value in text]
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD)
+        collator_module.get_parallel_state = lambda: state
+        trainer, _ = _build_trainer(state, distributed=True)
+        trainer._dpo_provenance_required = True
+        trainer.base.args.dpo_config.explicit_segment_provenance = True
+        trainer.base.args.data = SimpleNamespace(enable_multisource=False)
+        collator = DPOProvenanceCollator(MainCollator())
+        feature = process_dpo_example(
+            {"chosen": "!Bx", "rejected": "!Ax"}, tokenizer=Tokenizer(), record_segment_provenance=True
+        )[0]
+        batches = [collator([feature])]
+
+        def callback(micro_batches, **kwargs):
+            if rank == 1:
+                if scenario == "padding":
+                    micro_batches[0]["padding_flag"] = True
+                elif scenario == "proof":
+                    micro_batches[0].pop(dpo.DPO_APPROVED_KEY)
+                else:
+                    micro_batches.clear()
+
+        trainer.base.on_step_begin = callback
+        with pytest.raises(RuntimeError, match="DPO step-begin callback failed"):
+            trainer.train_step(iter([batches]))
+        assert trainer.state.global_step == 0
+        assert trainer.policy_model.optimizer.steps == 0
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("scenario", ["padding", "proof", "count"])
+def test_provenance_callback_mutation_fails_on_all_ranks(scenario):
+    spawn_with_rendezvous(_provenance_callback_mutation_worker, args=(scenario,), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("channel_loss", [False, True])
 def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch, channel_loss):
     import veomni.data.data_collator as collator_module

@@ -18,7 +18,86 @@ import torch
 
 from ..distributed.parallel_state import get_parallel_state
 from .constants import IGNORE_INDEX
+from .device import get_device_type
 from .dist_utils import all_reduce
+
+
+def is_padding_microbatch(batch) -> bool:
+    return isinstance(batch, dict) and bool(batch.get("padding_flag", False))
+
+
+def contains_padding(batch) -> bool:
+    if isinstance(batch, (list, tuple)):
+        return any(contains_padding(item) for item in batch)
+    return is_padding_microbatch(batch)
+
+
+def step_batch_structure(batch):
+    """Record callback-invariant microbatch identities and reduction structure."""
+    if isinstance(batch, (list, tuple)):
+        return (type(batch), tuple(step_batch_structure(item) for item in batch))
+    if isinstance(batch, dict):
+        auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
+        return (id(batch), is_padding_microbatch(batch), auxiliary)
+    return (type(batch), id(batch))
+
+
+def _distributed_batch_status(batch, invalid: bool, has_auxiliary_targets: bool = False):
+    count = len(batch) if isinstance(batch, (list, tuple)) else 1
+    device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+    flags = torch.tensor([int(invalid), int(has_auxiliary_targets), count, -count], dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+    values = flags.tolist()
+    return bool(values[0]) or values[2] != -values[3], bool(values[1])
+
+
+def reject_objective_padding(batch, objective: str) -> None:
+    found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        found, _ = _distributed_batch_status(batch, found)
+    if found:
+        raise ValueError(
+            f"{objective} does not support padded micro-batches, an empty step, or unequal microbatch counts across ranks"
+        )
+
+
+def synchronize_step_begin_error(error: Exception | None, objective: str) -> None:
+    """Propagate real callback errors before distributed model collectives."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError(f"{objective} step-begin callback failed on a rank") from error
+    elif error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError(f"{objective} step-begin callback raised StopIteration") from error
+        raise error
+
+
+def _has_auxiliary_labels(batch) -> bool:
+    if isinstance(batch, dict):
+        return any(key.endswith("_labels") for key in batch)
+    if isinstance(batch, (list, tuple)):
+        return any(_has_auxiliary_labels(item) for item in batch)
+    return False
+
+
+def reject_distributed_padding(batch) -> bool:
+    """Reject unequal/padded steps and return whether any rank has auxiliary labels."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+        has_auxiliary_targets = _has_auxiliary_labels(batch)
+        found, has_auxiliary_targets = _distributed_batch_status(
+            batch, invalid, has_auxiliary_targets=has_auxiliary_targets
+        )
+        if found:
+            raise RuntimeError(
+                "Distributed training does not support padded micro-batches, an empty step, "
+                "or unequal microbatch counts across ranks"
+            )
+        return has_auxiliary_targets
+    return False
 
 
 def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):
@@ -30,7 +109,12 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     }
 
     def _count(obj):
-        if isinstance(obj, dict) and not obj.get("padding_flag", False):
+        if isinstance(obj, dict):
+            if is_padding_microbatch(obj):
+                for key in obj:
+                    if key.endswith("_labels"):
+                        token_len.setdefault(f"{key.split('_labels')[0]}_tokens", torch.tensor(0))
+                return
             token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
 
             for key in obj.keys():
@@ -46,6 +130,15 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
             raise TypeError(f"Unsupported batch type: {type(obj)}")
 
     _count(batches)
+    return token_len
+
+
+def synchronize_auxiliary_loss_tokens(token_len):
+    """Reduce the same ordered token keys when different ranks see different modalities."""
+    key_lists = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(key_lists, sorted(token_len))
+    for key in sorted({key for keys in key_lists for key in keys}):
+        token_len.setdefault(key, torch.tensor(0))
     return token_len
 
 
@@ -92,6 +185,35 @@ def mean_global_loss(
     return loss_dict
 
 
-def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -> dict[str, float]:
+def reduce_global_loss_token(
+    micro_batches_token_len: dict[str, torch.Tensor], *, error: Exception | None = None, sync_auxiliary: bool = False
+) -> dict[str, float]:
     """All-reduce per-step loss-token denominators once for reuse across micro-batches."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        # Reuse the existing foundation-token reduction to propagate a
+        # rank-local callback/counting error without another collective.
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        local = torch.tensor(
+            [micro_batches_token_len["foundation_tokens"].item(), int(error is not None)],
+            dtype=torch.float,
+            device=device,
+        )
+        foundation, failures = all_reduce(local, op="sum")
+        if failures:
+            raise RuntimeError("Step-begin callback or loss-token counting failed on a rank") from error
+        if sync_auxiliary:
+            synchronize_auxiliary_loss_tokens(micro_batches_token_len)
+        reduced = {"foundation_tokens": foundation}
+        reduced.update(
+            {
+                key: all_reduce(value.item(), op="sum")
+                for key, value in sorted(micro_batches_token_len.items())
+                if key != "foundation_tokens"
+            }
+        )
+        return reduced
+    if error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError("Step-begin callback raised StopIteration") from error
+        raise error
     return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}
