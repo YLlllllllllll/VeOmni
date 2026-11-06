@@ -326,6 +326,8 @@ class ModelCheckpointManager:
                 "_veomni_scheduler_object": self.runtime.lr_scheduler,
             }
             kwargs = self._checkpointer_kwargs()
+            if getattr(self.config, "dcp_evict_source_cache", False):
+                kwargs["evict_source_cache"] = True
             multi = getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True
         except BaseException as exc:
             error = exc

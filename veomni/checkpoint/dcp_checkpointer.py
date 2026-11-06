@@ -2800,6 +2800,7 @@ class DistributedCheckpointer(CheckpointerBase):
         trainable_only: bool = False,
         parallel_state=None,
         legacy_expert_source_layout: Optional[str] = None,
+        evict_source_cache: bool = False,
     ) -> Dict[str, Any]:
         """Load a checkpoint, invalidating file-backed state after any failure."""
         try:
@@ -2811,6 +2812,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 trainable_only,
                 parallel_state,
                 legacy_expert_source_layout=legacy_expert_source_layout,
+                evict_source_cache=evict_source_cache,
             )
         except BaseException:
             try:
@@ -2835,6 +2837,7 @@ class DistributedCheckpointer(CheckpointerBase):
         parallel_state=None,
         *,
         legacy_expert_source_layout: Optional[str] = None,
+        evict_source_cache: bool = False,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -2854,6 +2857,8 @@ class DistributedCheckpointer(CheckpointerBase):
             legacy_expert_source_layout: Optional, trusted declaration of an
                 unversioned model-only checkpoint's source layout. It must be
                 identical on all ranks and cannot be used for optimizer restore.
+            evict_source_cache: Advise the OS to release checkpoint ranges after
+                reading them. This optional hint does not change restored values.
             trainable_only: when True, ``set_model_state_dict`` runs in non-strict
                 mode (``StateDictOptions(strict=False)``). Use this for LoRA / PEFT
                 resumes where the DCP only contains trainable adapter weights and the
@@ -2882,6 +2887,13 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=True,
                 process_group=process_group,
             )
+
+        def _reader(directory):
+            if evict_source_cache:
+                from .cache_aware_reader import CacheAwareFileSystemReader
+
+                return CacheAwareFileSystemReader(directory)
+            return cls._create_storage_reader(directory)
 
         wants_optimizer, fused_dir, error = False, None, None
         try:
@@ -2930,7 +2942,7 @@ class DistributedCheckpointer(CheckpointerBase):
             marker_error = None
             try:
                 source_path = fused_dir if fused_dir is not None else weights_dir(path, module)
-                _read_extra_parallel_marker(cls._create_storage_reader(source_path), _extra_parallel_layout_key(specs))
+                _read_extra_parallel_marker(_reader(source_path), _extra_parallel_layout_key(specs))
             except BaseException as exc:
                 marker_error = exc
             raise_if_any_rank_failed(marker_error, "validating ExtraParallel checkpoint marker", group=process_group)
@@ -2943,7 +2955,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 _preflight_multi_optimizer_layout(
                     state["model"],
                     optimizer,
-                    cls._create_storage_reader,
+                    _reader,
                     optimizer_path,
                     model_path,
                     root,
@@ -2957,7 +2969,7 @@ class DistributedCheckpointer(CheckpointerBase):
             _prepare_multi_optimizer_saved_states(
                 state["model"],
                 optimizer,
-                cls._create_storage_reader,
+                _reader,
                 optimizer_path,
                 optimizer_id,
                 group=process_group,
@@ -2973,7 +2985,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     optimizer=optimizer,
                     group=process_group,
                 )
-                reader = cls._create_storage_reader(model_path)
+                reader = _reader(model_path)
                 planner = _ModelStrictLoadPlanner(
                     strict_model=not trainable_only,
                     expected_save_id=model_id,
@@ -2992,7 +3004,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 _prepare_multi_optimizer_saved_states(
                     state["model"],
                     optimizer,
-                    cls._create_storage_reader,
+                    _reader,
                     optimizer_path,
                     optimizer_id,
                     group=process_group,
@@ -3009,7 +3021,7 @@ class DistributedCheckpointer(CheckpointerBase):
                         expected_layout=expected_layout,
                         group=process_group,
                     )
-                    reader = cls._create_storage_reader(optimizer_path)
+                    reader = _reader(optimizer_path)
                     planner = _ModelStrictLoadPlanner(
                         strict_model=False,
                         expected_save_id=optimizer_id,
@@ -3044,9 +3056,9 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             model_state = _model_state()
             optimizer_state = _optimizer_state() if wants_optimizer else None
-            model_reader = cls._create_storage_reader(fused_dir or weights_dir(path, module))
+            model_reader = _reader(fused_dir or weights_dir(path, module))
             if wants_optimizer and fused_dir is None:
-                optimizer_reader = cls._create_storage_reader(optimizer_dir(path, module))
+                optimizer_reader = _reader(optimizer_dir(path, module))
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "preparing distributed checkpoint load", group=process_group)

@@ -731,3 +731,16 @@ checkpoints and changed freeze configurations require verified migration.
 - [Rank-local AdamW checkpoint adapters](../design/rank_local_adamw_checkpoint_adapter.md) — registration, ownership and save/load contract.
 - [Trainer callbacks](trainer.md#callbacks) — `CheckpointCallback` (when) vs `GlobalStateCallback` (job cursor).
 - [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving) — adapter export under `lora_ckpt/`.
+
+### Optional source cache advice during DCP load
+
+For memory-constrained hosts, `train.checkpoint.dcp_evict_source_cache=true`
+asks the OS to discard the model and optimizer DCP tensor ranges this rank has
+finished reading. Metadata and separately loaded sidecars are not necessarily
+covered. It is disabled by default and requires POSIX `posix_fadvise` support.
+Advice is per host and does not guarantee eviction; shared shards may be read
+by other ranks at the same time, causing additional I/O or longer loading.
+Symbolic-link shards remain readable, but their cache advice is skipped with
+a warning.
+Benchmark the actual filesystem and topology before enabling this option.
+This flag does not change checkpoint contents or optimizer precision.

@@ -48,7 +48,8 @@ def _update(model, optimizer):
     optimizer.zero_grad()
 
 
-def test_file_backed_ple_matches_fp32_and_strict_dcp_next_update(tmp_path):
+@pytest.mark.parametrize("evict_source_cache", [False, True])
+def test_file_backed_ple_matches_fp32_and_strict_dcp_next_update(tmp_path, evict_source_cache):
     scratch = tmp_path / "scratch"
     scratch.mkdir(mode=0o700)
     model, leaf, optimizer = _build(scratch, True)
@@ -70,7 +71,10 @@ def test_file_backed_ple_matches_fp32_and_strict_dcp_next_update(tmp_path):
     )
     target, target_leaf, restored = _build(scratch, True)
     DistributedCheckpointer.load(
-        str(path), {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=parallel
+        str(path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+        evict_source_cache=evict_source_cache,
     )
     target_param = target.ngram_embedding.weight
     for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
