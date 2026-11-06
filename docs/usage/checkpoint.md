@@ -394,6 +394,9 @@ For SeedOmni, `extra_parallel_canonical_layout: true` is applied after each
 module-scope wrap. Combined `fsdp_scope: model` and active ExtraParallel is not
 supported with this option and fails before wrapping; use module scope. All
 ranks participating in a module or model scope must use the same layout flag.
+For a `MultiOptimizer`, save and load check that this canonical-layout policy
+agrees across the participating ranks before collecting model state. The
+standard trainer currently supports pipeline parallel size one.
 
 The versioned EP-outer tensor namespace is opt-in through
 `SpecInfo.checkpoint_layout_v2`. Ordinary ExtraParallel saves also use canonical

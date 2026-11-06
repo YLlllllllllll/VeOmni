@@ -978,7 +978,7 @@ def _reject_unproven_extra_parallel_optimizer(
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel optimizer state", group=group)
-    if dist.is_initialized():
+    if allow_proven_optimizer and dist.is_initialized():
         layouts = [None] * dist.get_world_size(group=group)
         dist.all_gather_object(layouts, has_canonical_layout, group=group)
         if any(layout != has_canonical_layout for layout in layouts):
@@ -2902,7 +2902,7 @@ class DistributedCheckpointer(CheckpointerBase):
         raise_if_any_rank_failed(error, "checking ExtraParallel marker policy", group=process_group)
         if dist.is_initialized():
             decisions = [None] * dist.get_world_size(group=process_group)
-            local = (fused_dir, wants_optimizer, multi, needs_marker)
+            local = (fused_dir, wants_optimizer, multi, needs_marker if multi else None)
             dist.all_gather_object(decisions, local, group=process_group)
             if any(decision != local for decision in decisions):
                 raise RuntimeError("Checkpoint load format differs across ranks")

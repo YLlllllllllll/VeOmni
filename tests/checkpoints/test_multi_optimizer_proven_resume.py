@@ -2160,6 +2160,40 @@ def test_asymmetric_marker_policy_rejects_before_io_on_all_ranks(tmp_path, opera
     spawn_with_rendezvous(_asymmetric_marker_policy_worker, args=(str(tmp_path / "checkpoint"), operation), nprocs=2)
 
 
+def _ordinary_heterogeneous_layout_worker(rank, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint import dcp_checkpointer as module
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = torch.nn.Linear(2, 2)
+        model._fqn2spec_info = {}
+        with (
+            patch.object(module, "_needs_extra_parallel_layout_marker", return_value=(rank == 0)),
+            patch.object(module, "_extra_parallel_layout_key", return_value="layout"),
+            patch.object(module, "get_model_state_dict", return_value={}),
+        ):
+            module._reject_unproven_extra_parallel_optimizer(
+                {"model": model}, SimpleNamespace(dp_mode="ddp"), saving=True
+            )
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_ordinary_checkpoint_guard_does_not_reject_heterogeneous_marker_flags():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_ordinary_heterogeneous_layout_worker, nprocs=2)
+
+
 def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
     from veomni.models.checkpoint.manager import _scheduler_recipe
 
