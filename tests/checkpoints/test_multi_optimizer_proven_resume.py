@@ -2118,7 +2118,7 @@ def test_multi_load_checks_scheduler_before_creating_generic_state_or_reader(tmp
     assert not calls
 
 
-def _asymmetric_marker_policy_worker(rank, checkpoint, operation, endpoint):
+def _asymmetric_marker_policy_worker(rank, checkpoint, operation, backend, endpoint):
     from datetime import timedelta
     from unittest.mock import patch
 
@@ -2126,7 +2126,11 @@ def _asymmetric_marker_policy_worker(rank, checkpoint, operation, endpoint):
 
     from veomni.checkpoint import dcp_checkpointer as module
 
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    if backend == "hccl":
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(rank)
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         model, optimizer = _model_and_optimizer()
         state = {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}
@@ -2145,7 +2149,8 @@ def _asymmetric_marker_policy_worker(rank, checkpoint, operation, endpoint):
             getattr(DistributedCheckpointer, operation)(
                 checkpoint, state, parallel_state=SimpleNamespace(dp_mode="ddp")
             )
-        completed = torch.tensor(1)
+        assert not Path(checkpoint).exists()
+        completed = torch.tensor(1, device=f"npu:{rank}" if backend == "hccl" else "cpu")
         dist.all_reduce(completed)
         assert completed.item() == 2
     finally:
@@ -2157,7 +2162,9 @@ def _asymmetric_marker_policy_worker(rank, checkpoint, operation, endpoint):
 def test_asymmetric_marker_policy_rejects_before_io_on_all_ranks(tmp_path, operation):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_asymmetric_marker_policy_worker, args=(str(tmp_path / "checkpoint"), operation), nprocs=2)
+    spawn_with_rendezvous(
+        _asymmetric_marker_policy_worker, args=(str(tmp_path / "checkpoint"), operation, "gloo"), nprocs=2
+    )
 
 
 def _ordinary_heterogeneous_layout_worker(rank, endpoint):
