@@ -25,7 +25,7 @@ import torch.distributed.checkpoint as dcp
 
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
-from veomni.models.checkpoint.weights import _save_state_dict as _save_safetensors
+from veomni.models.checkpoint.weights import _save_state_dict
 from veomni.models.qwen4_gdn_precision import (
     expected_qwen4_gdn_layer_ids,
     has_qwen4_exp_assets,
@@ -40,7 +40,7 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 
 
 logger = helper.create_logger(__name__)
-_save_state_dict = partial(_save_safetensors, legacy_fuse_fallback=True)
+_save_state_dict = partial(_save_state_dict, legacy_fuse_fallback=True)
 
 
 @torch.no_grad()
