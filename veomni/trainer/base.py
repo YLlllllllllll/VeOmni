@@ -796,14 +796,15 @@ class BaseTrainer(Stateful, ABC):
         error = None
         try:
             micro_batches = next(data_iterator)
+            self._step_preflight_start_time = time.time()
         except Exception as exc:  # noqa: BLE001 - coordinate before peers enter model collectives
             micro_batches, error = None, exc
         has_auxiliary_targets = reject_distributed_padding(micro_batches, check_fetch=True, fetch_error=error)
         return micro_batches, has_auxiliary_targets
 
     def _sft_step_preflight(self, micro_batches, callback_owner, *, has_auxiliary_targets=None):
-        self._step_preflight_start_time = time.time()
         if has_auxiliary_targets is None:
+            self._step_preflight_start_time = time.time()
             has_auxiliary_targets = reject_distributed_padding(micro_batches)
         if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
             raise ValueError("Padding inside an unpacked micro-batch is unsupported")

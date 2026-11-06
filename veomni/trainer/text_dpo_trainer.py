@@ -175,7 +175,7 @@ def _dpo_pair_weighting(
         for batch in micro_batches:
             if not isinstance(batch, dict):
                 raise ValueError("DPO microbatch must be a dictionary")
-            if batch.get("loss_weights") is not None:
+            if batch.get("loss_weight") is not None or batch.get("loss_weights") is not None:
                 raise ValueError("DPO does not support token loss_weights")
             if batch.get("padding_flag", False) is not False:
                 raise ValueError("DPO does not support duplicated padding microbatches in pair-mean training")
@@ -336,6 +336,8 @@ def _dpo_pair_weighting(
 def _dpo_sync_step_begin_error(error: Exception | None, *, context: str = "step-begin callback") -> None:
     """Prevent a local pre-forward callback failure stranding peers at the next collective."""
     if not dist.is_available() or not dist.is_initialized():
+        if isinstance(error, StopIteration):
+            raise RuntimeError(f"DPO {context} raised StopIteration") from error
         if error is not None:
             raise error
         return
@@ -1255,7 +1257,11 @@ class TextDPOTrainer:
                 self.on_step_begin(micro_batches=micro_batches)
                 if contains_padding(micro_batches):
                     raise ValueError("DPO step-begin callback introduced padding")
-                if any(batch.get("loss_weights") is not None for batch in micro_batches if isinstance(batch, dict)):
+                if any(
+                    batch.get("loss_weight") is not None or batch.get("loss_weights") is not None
+                    for batch in micro_batches
+                    if isinstance(batch, dict)
+                ):
                     raise ValueError("DPO does not support token loss_weights")
                 if provenance_enabled and len(micro_batches) != expected_microsteps:
                     raise ValueError("DPO step-begin callback changed proven microbatch count")

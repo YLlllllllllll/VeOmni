@@ -339,7 +339,7 @@ def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list
 
     def encode(messages, limit):
         result = chat_template.encode_messages(messages, max_seq_len=limit)
-        if result.get("loss_weights") is not None:
+        if result.get("loss_weight") is not None or result.get("loss_weights") is not None:
             raise ValueError("DPO does not support token loss_weights")
         return {
             key: result[key] if isinstance(result[key], torch.Tensor) else torch.tensor(result[key])
