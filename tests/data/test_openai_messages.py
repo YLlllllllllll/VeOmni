@@ -636,12 +636,20 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.data import data_collator
+    from veomni.data.chat_template import ChatmlTemplate
     from veomni.data.data_transform import process_sample_qwen_vl
     from veomni.data.multimodal import image_utils
     from veomni.models.configuration_base import as_veomni_config
     from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
         Qwen4ExpForConditionalGeneration,
     )
+
+    if weighted and not getattr(ChatmlTemplate, "supports_loss_weights", False):
+        pytest.skip("requires the independent weighted-loss feature")
+    if weighted:
+        assert "loss_weights" in ChatmlTemplate(_ToyTokenizer()).encode_messages(
+            [{"role": "assistant", "content": "answer", "loss_mask": 1, "loss_weight": 0.25}]
+        )
 
     class ImageProcessor:
         merge_size = 2
@@ -690,6 +698,9 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
     assert torch.equal(packed["input_ids"][0], torch.cat([first["input_ids"], second["input_ids"]]))
     assert torch.equal(packed["labels"][0], torch.cat([first["labels"], second["labels"]]))
     assert torch.equal(packed["image_mask"][0], torch.cat([first["image_mask"], second["image_mask"]]))
+    assert torch.equal(
+        packed["mm_token_type_ids"][0], torch.cat([first["mm_token_type_ids"], second["mm_token_type_ids"]])
+    )
     assert (first["labels"][1:] != -100).any() and (second["labels"][1:] != -100).any()
 
     def forward(feature, *, is_packed):
@@ -739,3 +750,37 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
         assert (actual_grad is None) == (param.grad is None), name
         if actual_grad is not None:
             torch.testing.assert_close(actual_grad, param.grad, rtol=3e-4, atol=3e-5, msg=name)
+
+
+def test_mm_token_types_follow_mixed_packing_and_sp_padding(monkeypatch):
+    import copy
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn.functional as F
+
+    from veomni.data import data_collator
+
+    features = []
+    for ids, types in (([1, 2], [0, 0]), ([3, 0, 4], [0, 1, 0])):
+        features.append(
+            {
+                "input_ids": torch.tensor(ids),
+                "labels": torch.tensor(ids),
+                "attention_mask": torch.ones(len(ids), dtype=torch.long),
+                "position_ids": torch.arange(len(ids)),
+                "image_mask": torch.tensor(types, dtype=torch.bool),
+                "mm_token_type_ids": torch.tensor(types),
+            }
+        )
+    expected = torch.tensor([0, 0, 0, 1, 0])
+    for rank in range(4):
+        monkeypatch.setattr(
+            data_collator,
+            "get_parallel_state",
+            lambda rank=rank: SimpleNamespace(sp_enabled=True, sp_size=4, sp_rank=rank),
+        )
+        batch = data_collator.MainCollator()(copy.deepcopy(features))
+        assert torch.equal(batch["mm_token_type_ids"][0], F.pad(expected, (0, 3)))
+        assert torch.equal(batch["mm_token_type_ids"] == 1, batch["image_mask"].bool())
+        assert batch["input_ids"].shape == (1, 2)
