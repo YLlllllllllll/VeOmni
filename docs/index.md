@@ -140,6 +140,7 @@ design/qwen4_exp_ple_2d_parallelism.md
 design/qwen38_ple_fileback_state.md
 design/qwen4_gdn_fp32_precision.md
 design/verl_topk_distill_integration.md
+design/qwen4_frozen_prefix.md
 design/deepseek_v4_context_parallel.md
 design/deepseek_v4_indexer_loss.md
 ```
