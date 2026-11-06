@@ -127,6 +127,8 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
             optimizer = None
         if failure == "swap_mismatch" and rank == 0:
             optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+        if failure == "previous_async_failure" and rank == 0:
+            DistributedCheckpointer._async_save_failed = True
         state = {
             "model": model,
             "optimizer": optimizer,
@@ -142,18 +144,26 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
             return original(value)
 
         with patch.object(checkpoint_module, "_requires_rank_local_optimizer_checkpoint", inspect_optimizer):
-            with pytest.raises((OSError, RuntimeError), match="injected|failed on another rank|optimizer.*differ"):
+            with pytest.raises(
+                (OSError, RuntimeError),
+                match="injected|failed on another rank|optimizer.*differ|previous asynchronous",
+            ):
                 getattr(DistributedCheckpointer, operation)(
                     checkpoint, state, parallel_state=SimpleNamespace(dp_mode="ddp")
                 )
         if operation == "load":
             assert "_veomni_optimizer_identity_verified" not in state
             assert "_veomni_optimizer_checkpoint_generation" not in state
+        if failure == "previous_async_failure":
+            assert DistributedCheckpointer._async_save_failed is True
+            with pytest.raises(RuntimeError, match="previous asynchronous DCP save failed"):
+                DistributedCheckpointer.wait_for_pending_save()
         assert not Path(checkpoint).exists()
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
     finally:
+        DistributedCheckpointer._async_save_failed = False
         dist.destroy_process_group()
 
 
@@ -168,6 +178,17 @@ def test_asymmetric_optimizer_policy_fails_before_checkpoint_io(tmp_path, operat
     spawn_with_rendezvous(
         _asymmetric_optimizer_policy_worker,
         args=(str(tmp_path / "checkpoint"), operation, failure),
+        nprocs=2,
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_asymmetric_previous_async_failure_stops_save_on_all_ranks(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(
+        _asymmetric_optimizer_policy_worker,
+        args=(str(tmp_path / "checkpoint"), "save", "previous_async_failure"),
         nprocs=2,
     )
 
@@ -587,7 +608,15 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
             return original(path)
 
         DistributedCheckpointer._create_storage_reader = classmethod(reader)
-        with pytest.raises((RuntimeError, OSError), match="inventory reader"):
+        expected = (
+            (OSError, "injected inventory reader failure")
+            if rank == 1
+            else (
+                RuntimeError,
+                "reading MultiOptimizer scheduler checkpoint failed on another rank",
+            )
+        )
+        with pytest.raises(expected[0], match=expected[1]):
             DistributedCheckpointer.load(
                 checkpoint,
                 {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
@@ -2063,6 +2092,72 @@ def test_multi_checkpoint_requires_explicit_scheduler_declaration(tmp_path):
     with pytest.raises(RuntimeError, match="scheduler object has no matching scheduler binding"):
         DistributedCheckpointer.save(str(tmp_path), state, parallel_state=SimpleNamespace(dp_mode="ddp"))
     assert not (tmp_path / "model").exists()
+
+
+@pytest.mark.parametrize("needs_marker", [False, True])
+def test_multi_load_checks_scheduler_before_creating_generic_state_or_reader(tmp_path, monkeypatch, needs_marker):
+    """A rejected multi-optimizer load must not create generic load machinery."""
+    from veomni.checkpoint import dcp_checkpointer as module
+
+    model, optimizer = _model_and_optimizer()
+    calls = []
+
+    def unexpected(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("generic load machinery created before scheduler validation")
+
+    monkeypatch.setattr(module, "ModelState", unexpected)
+    monkeypatch.setattr(module, "OptimizerState", unexpected)
+    monkeypatch.setattr(module, "_reject_unproven_extra_parallel_optimizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_needs_extra_parallel_layout_marker", lambda specs: needs_marker)
+    monkeypatch.setattr(DistributedCheckpointer, "_create_storage_reader", unexpected)
+    with pytest.raises(RuntimeError, match="explicit scheduler declaration"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert not calls
+
+
+def _asymmetric_marker_policy_worker(rank, checkpoint, operation, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint import dcp_checkpointer as module
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model, optimizer = _model_and_optimizer()
+        state = {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}
+        with (
+            patch.object(module, "_needs_extra_parallel_layout_marker", return_value=(rank == 0)),
+            patch.object(module, "_extra_parallel_layout_key", return_value="layout"),
+            patch.object(module, "get_model_state_dict", side_effect=AssertionError("state dict created")),
+            patch.object(
+                DistributedCheckpointer, "_create_storage_reader", side_effect=AssertionError("reader created")
+            ),
+            patch.object(
+                DistributedCheckpointer, "_create_storage_writer", side_effect=AssertionError("writer created")
+            ),
+            pytest.raises(RuntimeError, match="Canonical ExtraParallel layout differs across ranks"),
+        ):
+            getattr(DistributedCheckpointer, operation)(
+                checkpoint, state, parallel_state=SimpleNamespace(dp_mode="ddp")
+            )
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_asymmetric_marker_policy_rejects_before_io_on_all_ranks(tmp_path, operation):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_asymmetric_marker_policy_worker, args=(str(tmp_path / "checkpoint"), operation), nprocs=2)
 
 
 def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
