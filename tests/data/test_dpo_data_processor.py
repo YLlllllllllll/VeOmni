@@ -168,7 +168,7 @@ def test_dpo_rejects_weighted_input_without_silently_dropping_it(key):
         )
 
 
-@pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
+@pytest.mark.parametrize("key", ["loss_weights"])
 def test_dpo_rejects_template_produced_weights(key):
     class WeightedTemplate(_FakeChatTemplate):
         def encode_messages(self, messages, max_seq_len=None):
@@ -178,3 +178,17 @@ def test_dpo_rejects_template_produced_weights(key):
 
     with pytest.raises(ValueError, match="does not support token loss_weights"):
         process_dpo_example({"chosen": [1, 2], "rejected": [3, 4]}, chat_template=WeightedTemplate())
+
+
+@pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
+def test_dpo_provenance_render_rejects_template_produced_weights(key):
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    class WeightedTemplate(_FakeChatTemplate):
+        def encode_messages(self, messages, max_seq_len=None):
+            return {key: [0.5]}
+
+    chosen = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    rejected = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "b"}]
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        _dpo_conversation_encodings(WeightedTemplate(), chosen, rejected, 32)
