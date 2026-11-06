@@ -28,7 +28,11 @@ def main():
     actual = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if actual != args.expected_sha:
         raise RuntimeError(f"Expected source {args.expected_sha}, got {actual}")
-    subprocess.run(["git", "-C", str(root), "diff", "--quiet", "HEAD", "--"], check=True)
+    status = subprocess.check_output(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"], text=True
+    )
+    if status:
+        raise RuntimeError("The source checkout must have no tracked or untracked changes")
     if not torch.npu.is_available() or torch.npu.device_count() < 2:
         raise RuntimeError("The gate requires two native NPUs")
     args.junit_xml.parent.mkdir(parents=True, exist_ok=True)
