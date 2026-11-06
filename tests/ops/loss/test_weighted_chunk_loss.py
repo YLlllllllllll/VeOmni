@@ -85,6 +85,43 @@ def test_chatml_message_weights_and_legacy_binary():
     assert "loss_weights" not in template.encode_messages(messages[-1:])
 
 
+def test_chatml_nullable_mask_matches_role_defaults():
+    from types import SimpleNamespace
+
+    from veomni.data.chat_template import ChatmlTemplate
+
+    template = ChatmlTemplate(SimpleNamespace(encode=lambda text, add_special_tokens: list(text.encode())))
+    default = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a", "loss_weight": 0.25}]
+    nullable = [{**message, "loss_mask": None} for message in default]
+    assert template.encode_messages(nullable) == template.encode_messages(default)
+
+
+def test_truncated_fractional_turn_does_not_change_unweighted_normalization(monkeypatch):
+    from types import SimpleNamespace
+
+    from veomni.data.chat_template import ChatmlTemplate
+    from veomni.utils import loss_utils
+
+    template = ChatmlTemplate(SimpleNamespace(encode=lambda text, add_special_tokens: list(text.encode())))
+    tail = {"role": "assistant", "content": "normal tail"}
+    expected = template.encode_messages([tail])
+    actual = template.encode_messages(
+        [{"role": "assistant", "content": "removed", "loss_weight": 0.25}, tail],
+        max_seq_len=len(expected["input_ids"]),
+    )
+    assert actual == expected and "loss_weights" not in actual
+    first_only = template.encode_messages(
+        [{"role": "assistant", "content": "removed", "loss_weight": 0.25}, tail],
+        max_seq_len=len(expected["input_ids"]) + 1,
+    )
+    assert first_only["labels"][0] != -100 and "loss_weights" not in first_only
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(loss_utils, "all_reduce", lambda value, op: value)
+    batches = [{"labels": torch.tensor(actual["labels"])}, {"labels": torch.tensor([5, 6, 7])}]
+    weighted, _, totals = loss_utils.prepare_loss_token_counts(batches)
+    assert not weighted and totals["foundation_tokens"] == len(actual["labels"]) + 3
+
+
 def test_all_zero_weighted_step_is_rejected_before_optimizer(monkeypatch):
     from types import SimpleNamespace
 
@@ -179,6 +216,27 @@ def test_packing_rejects_per_sample_weight_misalignment_even_if_total_matches(mo
     ]
     with pytest.raises(ValueError, match="corresponding labels before packing"):
         m.PackingCollator()(samples)
+
+
+def test_packing_nullable_weights_match_missing_weights(monkeypatch):
+    from types import SimpleNamespace
+
+    from veomni.data import data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    first = {"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([-100, 2]), "position_ids": torch.arange(2)}
+    second = {
+        "input_ids": torch.tensor([3, 4]),
+        "labels": torch.tensor([-100, 4]),
+        "position_ids": torch.arange(2),
+        "loss_weights": torch.tensor([0.0, 0.25]),
+    }
+    baseline = m.MainCollator()([first.copy(), second.copy()])
+    nullable = m.MainCollator()([{**first, "loss_weights": None}, second.copy()])
+    assert torch.equal(nullable["labels"], baseline["labels"])
+    assert torch.equal(nullable["loss_weights"], baseline["loss_weights"])
+    all_null = m.MainCollator()([{**first, "loss_weights": None}])
+    assert "loss_weights" not in all_null
 
 
 def test_collator_packs_mixed_weighted_and_unweighted_samples(monkeypatch):
@@ -744,7 +802,7 @@ def test_weighted_router_aux_rejected_consistently_before_forward(monkeypatch):
 
     def collective(value, op):
         seen.append((value, op))
-        return [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]  # another rank requested router logits
+        return [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # another rank requested router logits
 
     monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
     monkeypatch.setattr(loss_utils, "all_reduce", collective)

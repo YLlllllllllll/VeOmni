@@ -39,7 +39,7 @@ def step_batch_structure(batch):
         return (type(batch), tuple(step_batch_structure(item) for item in batch))
     if isinstance(batch, dict):
         auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
-        return (id(batch), is_padding_microbatch(batch), "loss_weights" in batch, auxiliary)
+        return (id(batch), is_padding_microbatch(batch), batch.get("loss_weights") is not None, auxiliary)
     return (type(batch), id(batch))
 
 
@@ -280,7 +280,7 @@ def _iter_feature_dicts(value):
 
 def has_weighted_loss_in_step(batches: list[dict[str, torch.Tensor]]) -> bool:
     """Synchronize opt-in across DP ranks before counting non-SP causal targets."""
-    local_has_weights = any("loss_weights" in batch for batch in _iter_feature_dicts(batches))
+    local_has_weights = any(batch.get("loss_weights") is not None for batch in _iter_feature_dicts(batches))
     if get_parallel_state().sp_enabled or not torch.distributed.is_initialized():
         return local_has_weights
     return bool(all_reduce(int(local_has_weights), op="max"))
@@ -297,13 +297,13 @@ def prepare_loss_token_counts(
     """
     legacy = shifted = {"foundation_tokens": torch.tensor(0)}
     local_weighted = local_mtp = local_uncollated = local_router = invalid_router = False
-    unsupported_model = explicit_shift = explicit_count = scalar_labels = False
+    unsupported_model = explicit_shift = explicit_count = scalar_labels = local_auxiliary = False
     if error is None:
         try:
             features = [batch for batch in _iter_feature_dicts(batches) if not is_padding_microbatch(batch)]
-            local_weighted = any("loss_weights" in batch for batch in features)
+            local_weighted = any(batch.get("loss_weights") is not None for batch in features)
             for batch in features:
-                if "loss_weights" not in batch:
+                if batch.get("loss_weights") is None:
                     continue
                 weights = batch["loss_weights"]
                 if not isinstance(weights, torch.Tensor) or weights.is_complex():
@@ -317,6 +317,7 @@ def prepare_loss_token_counts(
                 if not bool(valid.all()):
                     raise ValueError("loss_weights must be in [0, 1] and positive weights must be normal float32")
             local_mtp = any("mtp_labels" in batch for batch in features)
+            local_auxiliary = any(any(key.endswith("_labels") for key in batch) for batch in features)
             scalar_labels = any(
                 isinstance(batch.get("labels"), torch.Tensor) and batch["labels"].ndim == 0 for batch in features
             )
@@ -362,11 +363,12 @@ def prepare_loss_token_counts(
             int(explicit_shift),
             int(explicit_count),
             int(scalar_labels),
+            int(local_auxiliary),
             int(error is not None),
         ],
         op="sum",
     )
-    if reduced[11]:
+    if reduced[12]:
         raise RuntimeError("Step-begin callback or loss-token counting failed on a rank") from error
     weighted = bool(reduced[2])
     if weighted and reduced[4]:
@@ -386,11 +388,15 @@ def prepare_loss_token_counts(
     if weighted and reduced[10]:
         raise ValueError("loss_weights require sequence labels on every rank")
     counts = shifted if weighted else legacy
-    if sync_auxiliary:
+    if (sync_auxiliary or reduced[11]) and torch.distributed.is_initialized():
         synchronize_auxiliary_loss_tokens(counts)
     global_counts = {"foundation_tokens": reduced[1] if weighted else reduced[0]}
     global_counts.update(
-        {key: all_reduce(value.item(), op="sum") for key, value in counts.items() if key != "foundation_tokens"}
+        {
+            key: all_reduce(value.item(), op="sum")
+            for key, value in sorted(counts.items())
+            if key != "foundation_tokens"
+        }
     )
     if not any(value > 0 for value in global_counts.values()):
         raise ValueError("Training step has no supervised target mass")

@@ -339,7 +339,7 @@ def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list
 
     def encode(messages, limit):
         result = chat_template.encode_messages(messages, max_seq_len=limit)
-        if "loss_weights" in result:
+        if result.get("loss_weights") is not None:
             raise ValueError("DPO does not support token loss_weights")
         return {
             key: result[key] if isinstance(result[key], torch.Tensor) else torch.tensor(result[key])
@@ -461,11 +461,13 @@ def process_dpo_example(
     """
     chosen_raw = example["chosen"]
     rejected_raw = example["rejected"]
-    if "loss_weight" in example or "loss_weights" in example:
+    if example.get("loss_weight") is not None or example.get("loss_weights") is not None:
         raise ValueError("DPO does not support token loss_weights")
     for branch in (chosen_raw, rejected_raw):
         if isinstance(branch, list) and any(
-            isinstance(message, dict) and ("loss_weight" in message or "loss_weights" in message) for message in branch
+            isinstance(message, dict)
+            and (message.get("loss_weight") is not None or message.get("loss_weights") is not None)
+            for message in branch
         ):
             raise ValueError("DPO does not support token loss_weights")
 
@@ -498,7 +500,7 @@ def process_dpo_example(
         else:
             chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
             rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
-            if "loss_weights" in chosen_tok or "loss_weights" in rejected_tok:
+            if chosen_tok.get("loss_weights") is not None or rejected_tok.get("loss_weights") is not None:
                 raise ValueError("DPO does not support token loss_weights")
     else:
         assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"

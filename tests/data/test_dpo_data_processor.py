@@ -91,6 +91,19 @@ def test_dpo_plaintext_prompt_masking():
     assert sample["labels"][chosen_len : chosen_len + 2].tolist() == [IGNORE_INDEX, IGNORE_INDEX]
 
 
+def test_dpo_nullable_weights_are_treated_as_absent():
+    sample = {"chosen": "cd", "rejected": "ef", "loss_weight": None, "loss_weights": None}
+    assert process_dpo_example(sample, tokenizer=_FakeTokenizer())[0]["input_ids"].numel() == 4
+
+    class NullableTemplate:
+        def encode_messages(self, messages, max_seq_len=None):
+            return {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [-100, 2], "loss_weights": None}
+
+    message = {"role": "assistant", "content": "answer", "loss_weight": None}
+    result = process_dpo_example({"chosen": [message], "rejected": [message]}, chat_template=NullableTemplate())
+    assert result[0]["input_ids"].numel() == 4
+
+
 def test_dpo_plaintext_truncation():
     """max_seq_len truncates each sequence independently before concatenation."""
     sample = process_dpo_example({"chosen": "abcdefgh", "rejected": "xyz"}, tokenizer=_FakeTokenizer(), max_seq_len=4)[

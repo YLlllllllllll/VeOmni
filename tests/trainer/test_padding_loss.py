@@ -223,7 +223,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         results = [None, None]
         dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
         assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
-        assert all(sizes == [7, 12] for _, _, sizes, *_ in results)
+        assert all(sizes == [7, 13] for _, _, sizes, *_ in results)
         assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
         assert results[1][3] and results[1][4] is None
 
@@ -624,6 +624,12 @@ def _zero_supervision_worker(rank, endpoint):
         local_label = 2 if rank == 1 else -100
         _, _, totals = loss_utils.prepare_loss_token_counts([{"labels": torch.tensor([[-100, local_label]])}])
         assert totals["foundation_tokens"] == 1
+        auxiliary = {"labels": torch.tensor([[-100, 1]])}
+        auxiliary["image_labels" if rank == 0 else "audio_labels"] = torch.tensor([1, 2, 3] if rank == 0 else [1])
+        _, _, totals = loss_utils.prepare_loss_token_counts([auxiliary], sync_auxiliary=True)
+        assert totals["image_tokens"] == 3 and totals["audio_tokens"] == 1
+        _, _, totals = loss_utils.prepare_loss_token_counts([auxiliary])
+        assert totals["image_tokens"] == 3 and totals["audio_tokens"] == 1
         with pytest.raises(ValueError, match="no supervised target mass"):
             loss_utils.prepare_loss_token_counts([{"labels": torch.tensor([[-100, -100]])}])
         completed = torch.tensor(1)
