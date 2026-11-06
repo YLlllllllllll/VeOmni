@@ -135,6 +135,11 @@ def process_conversation_example(
     else:
         raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
 
+    if (
+        any(isinstance(message, dict) and message.get("loss_weight") is not None for message in text_example)
+        and getattr(chat_template, "supports_loss_weights", False) is not True
+    ):
+        raise ValueError("This chat template does not support loss_weight")
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
@@ -334,6 +339,8 @@ def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list
 
     def encode(messages, limit):
         result = chat_template.encode_messages(messages, max_seq_len=limit)
+        if "loss_weights" in result:
+            raise ValueError("DPO does not support token loss_weights")
         return {
             key: result[key] if isinstance(result[key], torch.Tensor) else torch.tensor(result[key])
             for key in ("input_ids", "attention_mask", "labels")
@@ -454,6 +461,13 @@ def process_dpo_example(
     """
     chosen_raw = example["chosen"]
     rejected_raw = example["rejected"]
+    if "loss_weight" in example or "loss_weights" in example:
+        raise ValueError("DPO does not support token loss_weights")
+    for branch in (chosen_raw, rejected_raw):
+        if isinstance(branch, list) and any(
+            isinstance(message, dict) and ("loss_weight" in message or "loss_weights" in message) for message in branch
+        ):
+            raise ValueError("DPO does not support token loss_weights")
 
     if record_segment_provenance:
         # An all-one mask and physical lengths do not establish that an opaque
@@ -484,6 +498,8 @@ def process_dpo_example(
         else:
             chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
             rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
+            if "loss_weights" in chosen_tok or "loss_weights" in rejected_tok:
+                raise ValueError("DPO does not support token loss_weights")
     else:
         assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"
         prompt = example.get("prompt", "")
@@ -648,6 +664,7 @@ def _process_sample_qwen_vl_base(
     position_id_func: "Callable",
     **kwargs,
 ):
+    """Prepare Qwen-VL media and conversations while preserving supervision."""
     from .multimodal import conv_preprocess
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos_metadata
@@ -658,7 +675,8 @@ def _process_sample_qwen_vl_base(
         conversations = sample["conversations"]
     else:
         conversations = sample
-    conversations = conv_preprocess(source, conversations, **kwargs)
+    preprocess_kwargs = {**kwargs, "preserve_loss_supervision": True}
+    conversations = conv_preprocess(source, conversations, **preprocess_kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None

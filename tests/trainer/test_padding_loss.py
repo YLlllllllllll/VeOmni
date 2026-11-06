@@ -12,6 +12,21 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+def test_weighted_counts_exclude_padding_and_keep_causal_denominator(monkeypatch):
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(loss_utils, "all_reduce", lambda value, op: value)
+    batches = [
+        {"labels": torch.tensor([-100, 2, 3, 4]), "loss_weights": torch.tensor([1.0, 0.5, 0.25, 0.0])},
+        {"labels": torch.tensor([9, 8, 7])},
+        {"labels": torch.tensor([9, 8]), "loss_weights": torch.tensor([0.5]), "padding_flag": True},
+    ]
+    weighted, local, global_counts = loss_utils.prepare_loss_token_counts(batches)
+    assert weighted
+    torch.testing.assert_close(local["foundation_tokens"], torch.tensor(2.75))
+    assert global_counts["foundation_tokens"] == pytest.approx(2.75)
+    assert loss_utils.count_loss_token(batches[-1], weighted_normalization=True)["foundation_tokens"].item() == 0
+
+
 def test_padding_has_no_loss_tokens_or_gradient(monkeypatch):
     monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False, fsdp_size=1))
     real = {"labels": torch.tensor([3, -100])}
@@ -178,6 +193,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
 
     dist.all_reduce = counted_reduce
     try:
+        loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
         trainer = object.__new__(BaseTrainer)
         trainer.state = SimpleNamespace(global_step=3)
         trainer.args = SimpleNamespace(
@@ -207,7 +223,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         results = [None, None]
         dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
         assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
-        assert all(sizes == [4, 2] for _, _, sizes, *_ in results)
+        assert all(sizes == [7, 12] for _, _, sizes, *_ in results)
         assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
         assert results[1][3] and results[1][4] is None
 
@@ -420,9 +436,11 @@ def _sft_callback_structure_worker(rank, scenario, endpoint):
     import torch.distributed as dist
 
     from veomni.trainer.base import BaseTrainer
+    from veomni.utils import loss_utils
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
+        loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
         trainer = object.__new__(BaseTrainer)
         trainer.state = SimpleNamespace(global_step=3)
         trainer.model = SimpleNamespace()
@@ -437,6 +455,8 @@ def _sft_callback_structure_worker(rank, scenario, endpoint):
                     micro_batches.pop()
                 elif scenario == "order":
                     micro_batches.reverse()
+                elif scenario == "weight":
+                    micro_batches[0]["loss_weights"] = torch.ones_like(micro_batches[0]["labels"], dtype=torch.float32)
                 else:
                     micro_batches[0]["image_labels"] = torch.tensor([1])
 
@@ -452,11 +472,172 @@ def _sft_callback_structure_worker(rank, scenario, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("scenario", ["padding", "count", "order", "auxiliary"])
+@pytest.mark.parametrize("scenario", ["padding", "count", "order", "auxiliary", "weight"])
 def test_sft_callback_structure_failure_is_synchronized(scenario):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_sft_callback_structure_worker, args=(scenario,), nprocs=2)
+
+
+def _sft_weight_shape_failure_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.trainer.base import BaseTrainer
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
+        trainer = object.__new__(BaseTrainer)
+        trainer.state = SimpleNamespace(global_step=3)
+        trainer.model = SimpleNamespace(
+            model_config=SimpleNamespace(model_type="qwen4_exp"),
+            unwrapped_module=SimpleNamespace(veomni_ce=SimpleNamespace(impl="chunk_loss")),
+        )
+        trainer._reset_async_activation_offload_if_enabled = lambda _model: None
+        trainer.on_step_begin = lambda **kwargs: None
+        weights = torch.tensor([0.5]) if rank == 0 else torch.tensor([0.5, 0.5])
+        batches = [{"labels": torch.tensor([1, 2]), "loss_weights": weights}]
+        with pytest.raises(RuntimeError, match="callback or loss-token"):
+            trainer._sft_step_preflight(batches, trainer)
+        assert trainer.state.global_step == 3
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_sft_weight_shape_failure_is_synchronized():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_sft_weight_shape_failure_worker, nprocs=2)
+
+
+def _sft_fetch_failure_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.utils.data import DataLoader
+
+    from veomni.data import data_collator
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.text_trainer import TextTrainer
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        data_collator.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
+        for owner in (BaseTrainer, TextTrainer, VLMTrainer):
+            base = object.__new__(BaseTrainer)
+            base.state = SimpleNamespace(global_step=3)
+            trainer = base if owner is BaseTrainer else object.__new__(owner)
+            if owner is not BaseTrainer:
+                trainer.base = base
+            feature = {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([1, 2]),
+                "attention_mask": torch.tensor([1, 1]),
+                "position_ids": torch.tensor([0, 1]),
+                "loss_weights": torch.tensor([0.5] if rank == 1 else [0.5, 0.5]),
+            }
+            packer = data_collator.PackingCollator()
+            loader = DataLoader([feature], batch_size=1, collate_fn=lambda samples, packer=packer: [packer(samples)])
+            with pytest.raises(RuntimeError, match="SFT data loading failed on a rank"):
+                trainer.train_step(iter(loader))
+            assert base.state.global_step == 3
+            completed = torch.tensor(1)
+            dist.all_reduce(completed)
+            assert completed.item() == 2
+
+        base = object.__new__(BaseTrainer)
+        with pytest.raises(RuntimeError, match="Distributed training does not support"):
+            base._fetch_sft_micro_batches(iter([None if rank == 0 else [{"labels": torch.tensor([1])}]]))
+        with pytest.raises(RuntimeError, match="end of the data at different times"):
+            base._fetch_sft_micro_batches(iter([] if rank == 0 else [[{"labels": torch.tensor([1])}]]))
+        with pytest.raises(StopIteration):
+            base._fetch_sft_micro_batches(iter([]))
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_sft_real_loader_failure_and_eof_are_synchronized():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_sft_fetch_failure_worker, nprocs=2)
+
+
+def _weighted_option_failure_worker(rank, scenario, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
+        batch = {"labels": torch.tensor([[1, 2]])}
+        if rank == 0:
+            batch["loss_weights"] = torch.tensor([[0.5, float("nan") if scenario == "invalid" else 0.5]])
+        elif scenario == "shift":
+            batch["shift_labels"] = torch.tensor([[2, -100]])
+        elif scenario == "count":
+            batch["num_items_in_batch"] = 2
+        elif scenario == "scalar":
+            batch["labels"] = torch.tensor(1)
+        expected = {
+            "invalid": "callback or loss-token",
+            "shift": "shift_labels",
+            "count": "num_items_in_batch",
+            "scalar": "sequence labels",
+        }[scenario]
+        with pytest.raises((ValueError, RuntimeError), match=expected):
+            loss_utils.prepare_loss_token_counts([batch])
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("scenario", ["invalid", "shift", "count", "scalar"])
+def test_weighted_unsupported_option_fails_on_all_ranks(scenario):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_weighted_option_failure_worker, args=(scenario,), nprocs=2)
+
+
+def _zero_supervision_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
+        local_label = 2 if rank == 1 else -100
+        _, _, totals = loss_utils.prepare_loss_token_counts([{"labels": torch.tensor([[-100, local_label]])}])
+        assert totals["foundation_tokens"] == 1
+        with pytest.raises(ValueError, match="no supervised target mass"):
+            loss_utils.prepare_loss_token_counts([{"labels": torch.tensor([[-100, -100]])}])
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_zero_supervision_is_checked_globally():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_zero_supervision_worker, nprocs=2)
 
 
 @pytest.mark.parametrize("trainer_name", ["dpo", "omni"])
@@ -498,11 +679,6 @@ def test_all_padding_step_does_not_advance_training_state(monkeypatch, trainer_n
         "text": (text_module, text_module.TextTrainer),
         "vlm": (vlm_module, vlm_module.VLMTrainer),
     }[trainer_name]
-    monkeypatch.setattr(
-        base_module,
-        "reduce_global_loss_token",
-        lambda counts, **kwargs: {key: value.item() for key, value in counts.items()},
-    )
     trainer = object.__new__(cls)
     state = SimpleNamespace(global_step=3)
     updates = []

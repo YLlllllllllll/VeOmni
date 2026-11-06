@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -311,8 +311,10 @@ class VLMTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        real_micro_steps = self.base._sft_step_preflight(micro_batches, self)
+        micro_batches, has_auxiliary_targets = self.base._fetch_sft_micro_batches(data_iterator)
+        real_micro_steps = self.base._sft_step_preflight(
+            micro_batches, self, has_auxiliary_targets=has_auxiliary_targets
+        )
 
         # Forward and backward for each micro batch
         self.base.sync_before_train_step()
@@ -333,7 +335,9 @@ class VLMTrainer:
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            self.base.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self.base._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()

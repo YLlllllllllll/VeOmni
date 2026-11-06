@@ -530,6 +530,8 @@ def _provenance_callback_mutation_worker(rank, scenario, endpoint):
                     micro_batches[0]["padding_flag"] = True
                 elif scenario == "proof":
                     micro_batches[0].pop(dpo.DPO_APPROVED_KEY)
+                elif scenario == "weight":
+                    micro_batches[0]["loss_weights"] = torch.ones_like(micro_batches[0]["labels"], dtype=torch.float32)
                 else:
                     micro_batches.clear()
 
@@ -546,9 +548,30 @@ def _provenance_callback_mutation_worker(rank, scenario, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("scenario", ["padding", "proof", "count"])
+@pytest.mark.parametrize("scenario", ["padding", "proof", "count", "weight"])
 def test_provenance_callback_mutation_fails_on_all_ranks(scenario):
     spawn_with_rendezvous(_provenance_callback_mutation_worker, args=(scenario,), nprocs=2)
+
+
+def _dpo_weight_preflight_worker(rank, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD)
+        batch = _microbatch([1])
+        if rank == 1:
+            batch["loss_weights"] = torch.ones_like(batch["labels"], dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="DPO does not support token loss_weights"):
+            dpo._dpo_pair_weighting([batch], PostCollator(), state, False)
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_dpo_asymmetric_weight_rejected_before_forward():
+    spawn_with_rendezvous(_dpo_weight_preflight_worker, nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

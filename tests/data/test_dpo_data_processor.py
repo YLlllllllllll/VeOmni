@@ -42,6 +42,44 @@ def test_dpo_conversation_format():
         assert v.ndim == 1
 
 
+@pytest.mark.parametrize("provenance", [False, True])
+def test_dpo_rejects_explicit_loss_weight_before_rendering(provenance):
+    messages = [{"role": "assistant", "content": "answer", "loss_weight": 0.25}]
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        process_dpo_example(
+            {"chosen": messages, "rejected": [{"role": "assistant", "content": "other"}]},
+            chat_template=_FakeChatTemplate(),
+            record_segment_provenance=provenance,
+        )
+
+
+def test_dpo_rejects_token_weights_returned_by_legacy_template():
+    class WeightedTemplate(_FakeChatTemplate):
+        def encode_messages(self, messages, max_seq_len=None):
+            result = super().encode_messages(messages, max_seq_len)
+            result["loss_weights"] = [0.25] * len(messages)
+            return result
+
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        process_dpo_example({"chosen": [10, 20], "rejected": [30, 40]}, chat_template=WeightedTemplate())
+
+
+def test_dpo_rejects_token_weights_returned_by_provenance_template():
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    class WeightedTemplate:
+        def encode_messages(self, messages, max_seq_len=None):
+            return {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [-100, 2], "loss_weights": [0.0, 0.5]}
+
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        _dpo_conversation_encodings(
+            WeightedTemplate(),
+            [{"role": "assistant", "content": "chosen"}],
+            [{"role": "assistant", "content": "rejected"}],
+            64,
+        )
+
+
 def test_dpo_plaintext_prompt_masking():
     """Plaintext DPO: prompt tokens masked with IGNORE_INDEX in both chosen and rejected."""
     sample = process_dpo_example({"prompt": "ab", "chosen": "cd", "rejected": "efg"}, tokenizer=_FakeTokenizer())[0]

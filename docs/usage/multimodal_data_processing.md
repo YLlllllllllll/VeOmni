@@ -66,6 +66,34 @@ recovery.
 See the [checkpoint guide](checkpoint.md) for the available save and restore
 workflows.
 
+## Per-message loss weights for Qwen-VL
+
+For `sharegpt4v_sft` and `sharegpt4v_captioner_sft` samples consumed by the
+Qwen2-VL or Qwen3-VL template, an assistant turn may set binary `loss_mask`
+and a `loss_weight` between 0 and 1. For example:
+
+```json
+{"conversations": [
+  {"from": "human", "value": "<image>Describe this image."},
+  {"from": "gpt", "value": "A short response.", "loss_mask": 1, "loss_weight": 0.25},
+  {"from": "gpt", "value": "Not supervised.", "loss_mask": 0}
+], "images": ["image.jpg"], "source": "sharegpt4v_sft"}
+```
+
+The weight scales each supervised token's cross-entropy and the weighted mean
+uses the sum of token weights. A zero mask excludes the turn. Missing weights
+default to the binary mask. Fractional weights are currently supported only by the `qwen4_exp` VLM model and require
+the `chunk_loss` cross entropy implementation. Other models reject weighted batches. Batches containing MTP labels are not supported. Other
+multimodal preprocessors reject a supplied weight rather than discarding it.
+Router auxiliary loss with fractional loss weights is not supported and is rejected.
+Uncollated list-valued micro-batches, including the RL trainer path, reject
+weighted loss; ordinary unweighted RL batches continue to use their normal path.
+Channel loss remains an unweighted per-source CE metric; it does not represent
+the weighted optimization objective.
+If an entire step has no supervised target mass, it is rejected before
+the optimizer runs; this avoids changing weights through momentum or decay when
+the data requested no update. Weighted DPO is not supported and is rejected.
+
 ## Image Resolution Control
 
 Images are resized by `smart_resize` to satisfy three constraints simultaneously:

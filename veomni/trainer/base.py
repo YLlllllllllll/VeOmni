@@ -75,7 +75,7 @@ from ..utils.loss_utils import (
     count_loss_token,
     is_padding_microbatch,
     mean_global_loss,
-    reduce_global_loss_token,
+    prepare_loss_token_counts,
     reject_distributed_padding,
     step_batch_structure,
 )
@@ -792,9 +792,19 @@ class BaseTrainer(Stateful, ABC):
         if self.args.train.sync_each_train_step:
             synchronize()
 
-    def _sft_step_preflight(self, micro_batches, callback_owner):
+    def _fetch_sft_micro_batches(self, data_iterator):
+        error = None
+        try:
+            micro_batches = next(data_iterator)
+        except Exception as exc:  # noqa: BLE001 - coordinate before peers enter model collectives
+            micro_batches, error = None, exc
+        has_auxiliary_targets = reject_distributed_padding(micro_batches, check_fetch=True, fetch_error=error)
+        return micro_batches, has_auxiliary_targets
+
+    def _sft_step_preflight(self, micro_batches, callback_owner, *, has_auxiliary_targets=None):
         self._step_preflight_start_time = time.time()
-        has_auxiliary_targets = reject_distributed_padding(micro_batches)
+        if has_auxiliary_targets is None:
+            has_auxiliary_targets = reject_distributed_padding(micro_batches)
         if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
             raise ValueError("Padding inside an unpacked micro-batch is unsupported")
         real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
@@ -810,14 +820,14 @@ class BaseTrainer(Stateful, ABC):
                 callback_owner.on_step_begin(micro_batches=micro_batches)
                 if step_batch_structure(micro_batches) != original_structure:
                     raise ValueError("SFT step-begin callback changed microbatch structure or padding")
-                # Callbacks may adjust labels; normalize the inputs actually consumed.
-                self.micro_batches_token_len = count_loss_token(micro_batches)
             except Exception as exc:  # noqa: BLE001 - propagate on the existing token reduction
                 error = exc
-                self.micro_batches_token_len = {"foundation_tokens": torch.tensor(0)}
-            self.global_micro_batches_token_len = reduce_global_loss_token(
-                self.micro_batches_token_len, error=error, sync_auxiliary=has_auxiliary_targets
-            )
+            # Callbacks may adjust labels; normalize the inputs actually consumed.
+            (
+                self._weighted_loss_normalization,
+                self.micro_batches_token_len,
+                self.global_micro_batches_token_len,
+            ) = prepare_loss_token_counts(micro_batches, self.model, error=error, sync_auxiliary=has_auxiliary_targets)
         except BaseException:
             self.state.global_step = previous_step
             raise
@@ -828,8 +838,8 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        real_micro_steps = self._sft_step_preflight(micro_batches, self)
+        micro_batches, has_auxiliary_targets = self._fetch_sft_micro_batches(data_iterator)
+        real_micro_steps = self._sft_step_preflight(micro_batches, self, has_auxiliary_targets=has_auxiliary_targets)
 
         # Forward and backward for each micro batch
         self.sync_before_train_step()
@@ -850,7 +860,9 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch)
+            self.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()

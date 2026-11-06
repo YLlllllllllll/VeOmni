@@ -973,6 +973,16 @@ def test_channel_loss_rejects_base_rl_trainer():
         ChannelLossCallback(trainer)
 
 
+@pytest.mark.parametrize("field", ["source_id_keys", "source_name_keys", "extra_strip_keys"])
+def test_channel_loss_cannot_strip_training_loss_weights(field):
+    cfg = ChannelLossConfig(enable=True)
+    setattr(cfg, field, ["loss_weights"])
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+    with pytest.raises(ValueError, match="must not strip loss_weights"):
+        callback.on_step_begin(SimpleNamespace(global_step=1), micro_batches=[{"loss_weights": torch.ones(2)}])
+
+
 def test_channel_loss_resolve_source_name_handles_missing_environ_meter():
     cfg = ChannelLossConfig(enable=True)
     trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)

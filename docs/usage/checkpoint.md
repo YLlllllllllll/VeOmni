@@ -155,10 +155,9 @@ When main-process dynamic batching emits padded micro-batches in single-process
 SFT, padding is excluded from loss token counts, channel loss and auxiliary
 metrics, and its model forward/backward is skipped. Distributed main-process
 SFT dynamic batching must use `drop_last=True` until tail step counts can be
-coordinated across ranks. DPO uses its separate no-synthetic-padding tail
-policy and coordinates incompatible step counts and EOF before forward. All distributed loaders, including finite native
-worker-based loaders, must coordinate fetch failures and EOF before entering
-the trainer and avoid injecting padded micro-batches. DPO and Omni reject padded
+coordinated across ranks. SFT and DPO coordinate fetch failures and EOF before
+forward; DPO uses its separate no-synthetic-padding tail policy. Distributed
+loaders must avoid injecting padded micro-batches. DPO and Omni reject padded
 micro-batches; custom data loaders must not inject padding into those objectives.
 DiT also rejects marked padding.
 The distributed padding guard adds one small collective before step-begin
@@ -168,7 +167,7 @@ SFT still counts valid loss tokens after step-begin callbacks, so callbacks can
 adjust labels before the loss denominator is computed. Distributed training
 rejects unequal microbatch counts across ranks. SFT step-begin callbacks must
 not replace or reorder microbatches, or change the microbatch count, target-key
-structure or padding flags. DPO without explicit provenance revalidates its
+structure, presence of loss weights, or padding flags. DPO without explicit provenance revalidates its
 microbatches and pair counts after callbacks; proven DPO inputs must retain
 their validated provenance. Callback-internal collectives must coordinate their
 own failures; a failure before such a collective can still strand another rank.

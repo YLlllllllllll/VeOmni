@@ -3168,7 +3168,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -2396,47 +3933,10 @@
+@@ -2396,47 +3933,13 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -3216,11 +3216,14 @@
 +    ) -> tuple | Qwen4ExpCausalLMOutputWithLogProbs:
 +        # --- Patch.1: Forward the packed position-id layout to the VLM model. ---
 +        position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
++        loss_weights = kwargs.pop("loss_weights", None)
++        if loss_weights is not None and kwargs.get("output_router_logits", False):
++            raise ValueError("loss_weights cannot be combined with router auxiliary loss")
 +        # --- Patch.1 ---
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +3948,64 @@
+@@ -2448,33 +3951,65 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -3249,6 +3252,7 @@
 +                vocab_size=self.config.text_config.vocab_size,
 +                hidden_states=hidden_states,
 +                weights=self.lm_head.weight,
++                loss_weights=loss_weights,
 +                **kwargs,
 +            )
 +        else:
@@ -3300,7 +3304,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +4014,7 @@
+@@ -2483,6 +4018,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -3308,7 +3312,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +4228,34 @@
+@@ -2696,6 +4232,34 @@
          }
          return causal_mask_mapping
 
