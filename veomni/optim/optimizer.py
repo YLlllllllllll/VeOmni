@@ -1071,6 +1071,12 @@ def build_optimizer(
     """
     if isinstance(betas, list):
         betas = tuple(betas)
+
+    if optimizer_type == "muon" and any(
+        parameter.requires_grad and getattr(parameter, "_veomni_optimizer_compute_device", None) is not None
+        for parameter in model.parameters()
+    ):
+        raise ValueError("DistributedMuon does not support selectively CPU-offloaded parameters")
     if optimizer_type == "muon":
         if optimizer_config is not None:
             muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}

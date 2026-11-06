@@ -464,8 +464,6 @@ def save_lora_adapter_with_dcp(
     from veomni.lora import is_veomni_lora_model
     from veomni.lora.state_dict import get_lora_state_dict, validate_lora_export_covers_trainable
 
-    from .dist_utils import raise_if_any_rank_failed
-
     if not is_veomni_lora_model(model):
         raise TypeError(
             f"save_lora_adapter_with_dcp expects a VeOmniLoraModel, got {type(model).__name__}. "
