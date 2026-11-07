@@ -327,6 +327,7 @@ class DistributedDataloader(StatefulDataLoader):
             self.timeout = timeout
 
     def prepare_resume_epoch(self, epoch: int) -> None:
+        """Forward a resume-only epoch hint when the dataset supports it."""
         prepare = getattr(self.dataset, "prepare_resume_epoch", None)
         if callable(prepare):
             prepare(epoch)

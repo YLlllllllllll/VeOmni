@@ -796,6 +796,7 @@ class DynamicBatchSizeDataLoader:
         self._dpo_flushed_source_state = None
 
     def prepare_resume_epoch(self, epoch: int) -> None:
+        """Forward a resume-only epoch hint to the wrapped loader when supported."""
         prepare = getattr(self._dataloader, "prepare_resume_epoch", None)
         if callable(prepare):
             prepare(epoch)

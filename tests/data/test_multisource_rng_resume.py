@@ -26,6 +26,7 @@ class Source(torch.utils.data.IterableDataset):
         self.cursor = 0
 
     def set_epoch(self, epoch):
+        """Reset the synthetic source cursor when the epoch changes."""
         if epoch != self.epoch:
             self.epoch, self.cursor = epoch, 0
 
@@ -33,6 +34,7 @@ class Source(torch.utils.data.IterableDataset):
         self.epoch, self.cursor = epoch, 0
 
     def __iter__(self):
+        """Yield deterministic IDs for the active epoch and worker."""
         worker = torch.utils.data.get_worker_info()
         worker_id = worker.id if worker else 0
         while self.cursor < 20:
@@ -75,6 +77,7 @@ def make_dataset(seed):
 
 
 def rows(iterator, count):
+    """Read sample IDs and source indices from nested batches."""
     samples = (next(iterator)[0][0] for _ in range(count))
     return [(item["id"], item["ds_idx"]) for item in samples]
 
@@ -84,6 +87,7 @@ def rows(iterator, count):
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("seed", [0, 1, 29])
 def test_worker_sampling_resume_before_each_worker_starts(workers, persistent, epoch, prefetch, seed):
+    """Compare restored sampling order after an early snapshot across worker and prefetch settings."""
     sources = []
 
     def make_loader():
@@ -167,7 +171,10 @@ def test_legacy_checkpoint_keeps_existing_started_iterator_behavior():
 @pytest.mark.parametrize("worker_batching", [False, True])
 @pytest.mark.parametrize("epoch", [0, 2])
 def test_legacy_loader_resume_after_epoch_set_survives_next_epoch(worker_batching, epoch):
+    """Legacy cursor recovery preserves both its epoch and the following epoch."""
+
     def make_loader():
+        """Build a multi-source loader with or without a batching dataset."""
         dataset = make_dataset(seed=5)
         if worker_batching:
             dataset = DynamicBatchingSizeDataset(
@@ -223,6 +230,7 @@ def test_legacy_main_process_batching_rejects_unproven_epoch(workers, monkeypatc
         return DynamicBatchSizeDataLoader(source, strategy, length=40)
 
     def sampling_states(value):
+        """Find nested multi-source runtime states in a loader snapshot."""
         if isinstance(value, dict):
             if "topology" in value and "runtime" in value and "dataset_states" in value["runtime"]:
                 yield value["runtime"]
@@ -278,6 +286,7 @@ def test_legacy_main_process_batching_rejects_unproven_epoch(workers, monkeypatc
 
 
 def direct_rows(iterator, count):
+    """Read unbatched sample IDs and their source indices."""
     return [(sample["id"], sample["ds_idx"]) for sample in (next(iterator) for _ in range(count))]
 
 
@@ -329,6 +338,7 @@ def test_legacy_resume_then_second_snapshot_retains_started_rng():
 
 @pytest.mark.parametrize("epoch", [0, 2])
 def test_legacy_resaved_before_epoch_is_supplied_retains_unknown_epoch(epoch):
+    """Repeated snapshots preserve an unknown legacy epoch until it is supplied."""
     source = make_dataset(seed=5)
     source.set_epoch(epoch)
     iterator = iter(source)
@@ -349,6 +359,7 @@ def test_legacy_resaved_before_epoch_is_supplied_retains_unknown_epoch(epoch):
 
 
 def test_legacy_consumption_without_epoch_remains_resumable_but_rejects_late_epoch():
+    """Reject setting an unknown legacy epoch after sampling has already resumed."""
     source = make_dataset(seed=5)
     source.set_epoch(2)
     iterator = iter(source)
@@ -374,6 +385,7 @@ def test_legacy_consumption_without_epoch_remains_resumable_but_rejects_late_epo
 
 
 def test_legacy_restore_does_not_reuse_an_epoch_from_before_sampling():
+    """Do not reuse an epoch observed before restoring a legacy cursor."""
     source = make_dataset(seed=5)
     source.set_epoch(2)
     direct_rows(iter(source), 4)
@@ -388,6 +400,7 @@ def test_legacy_restore_does_not_reuse_an_epoch_from_before_sampling():
 
 @pytest.mark.parametrize("seed", [0, 1, 5, 29])
 def test_uninterrupted_epoch_sampling_matches_independent_seed_reference(seed):
+    """Compare uninterrupted source choices with an independently seeded RNG."""
     source = make_dataset(seed=seed)
     for epoch in range(3):
         source.set_epoch(epoch)
@@ -403,6 +416,7 @@ def test_uninterrupted_epoch_sampling_matches_independent_seed_reference(seed):
 
 
 def test_invalid_initialization_marker_fails_before_mutating_sources():
+    """Reject an invalid initialization marker without modifying upstream cursors."""
     source = make_dataset(seed=5)
     state = copy.deepcopy(source.state_dict())
     state["runtime"]["sampling_initialized"] = 1
@@ -433,6 +447,7 @@ def update(weight, optimizer, iterator):
 
 
 def fresh_resume(_rank, checkpoint_path, result_path):
+    """Restore a loader and optimizer in a new process and save the next update."""
     import veomni.data.dataset as dataset_module
 
     dataset_module.get_parallel_state = lambda: SimpleNamespace(dp_rank=0, dp_size=1)
@@ -457,6 +472,7 @@ def fresh_resume(_rank, checkpoint_path, result_path):
 
 
 def test_multisource_worker_cold_resume_next_optimizer_update(tmp_path):
+    """Match the next sample and optimizer update after a fresh-process restore."""
     import torch.multiprocessing as mp
 
     loader = make_prefetch_loader()
