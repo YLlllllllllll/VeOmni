@@ -37,10 +37,10 @@ class LoaderWrapper:
 
 The built-in restore path is:
 
-1. [`GlobalStateCallback.load_global_state()`](../../veomni/trainer/callbacks/global_state_callback.py#L244)
+1. [`GlobalStateCallback.load_global_state()`](../../veomni/trainer/callbacks/global_state_callback.py#L485)
    computes the saved position and calls the hook for a mid-epoch restore.
-2. The optional [main-process dynamic batcher](../../veomni/data/dynamic_batching.py#L413)
-   forwards the hook to the [distributed loader](../../veomni/data/data_loader.py#L55),
+2. The optional [main-process dynamic batcher](../../veomni/data/dynamic_batching.py#L798)
+   forwards the hook to the [distributed loader](../../veomni/data/data_loader.py#L179),
    which forwards it to its dataset.
 3. The optional [worker-side batching dataset](../../veomni/data/dataset.py#L1571)
    forwards it to the [multi-source dataset](../../veomni/data/dataset.py#L719).
