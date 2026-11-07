@@ -298,7 +298,7 @@ def _path_failure_worker(rank, store):
                 if rank == failed_rank
                 else original_step_dir
             )
-            global_state_callback.layout.remove_manifest = lambda path: removed.append(path)
+            global_state_callback.layout.remove_manifest = lambda path, observed=removed: observed.append(path)
             with pytest.raises((RuntimeError, ValueError)):
                 callback.save_global_state(SimpleNamespace(global_step=1, epoch=0))
             assert not removed
