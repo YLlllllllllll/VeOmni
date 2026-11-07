@@ -1033,6 +1033,7 @@ class GlobalStateCallback(Callback):
             if sft_next_epoch:
                 loader.load_sft_next_epoch_buffer(prepared_sft_buffer)
             else:
+
                 def prepare_resume_epoch():
                     prepare = getattr(loader, "prepare_resume_epoch", None)
                     if self.trainer.start_step != 0 and callable(prepare):
