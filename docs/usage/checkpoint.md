@@ -728,6 +728,7 @@ checkpoints and changed freeze configurations require verified migration.
 
 ## Related pages
 
+- [Data loader resume protocol](dataloader_resume_protocol.md) — forwarding the saved epoch before restoring a legacy multi-source cursor.
 - [Checkpoint conversion](checkpoint_conversion.md) — DCP shards → HuggingFace safetensors (`scripts/merge_dcp_to_hf.py`).
 - [Rank-local AdamW checkpoint adapters](../design/rank_local_adamw_checkpoint_adapter.md) — registration, ownership and save/load contract.
 - [Trainer callbacks](trainer.md#callbacks) — `CheckpointCallback` (when) vs `GlobalStateCallback` (job cursor).
