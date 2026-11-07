@@ -628,7 +628,8 @@ validates its local precision settings and constructed expert modules before
 FSDP wrapping. As with the rest of the trainer configuration, all ranks must
 use the same settings. Composed Omni wraps and custom model parallelization
 reject the opt-in. MoE LoRA expert wrappers also reject the opt-in because
-their separate kernel is not covered. DPO reference-model isolation and resume
+their separate kernel is not covered. DPO keeps the option on the policy and
+disables this weight-gradient-only option on its frozen reference model. Resume
 configuration checks are not wired by this option yet. Keep the setting fixed
 across checkpoint save and resume when comparing training trajectories.
 
