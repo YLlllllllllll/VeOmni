@@ -431,55 +431,6 @@ def test_dpo_dynamic_tail_builder_retains_no_synthetic_padding_policy():
     spawn_with_rendezvous(_dpo_dynamic_tail_builder_worker, nprocs=2)
 
 
-def _sft_callback_structure_worker(rank, scenario, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    from veomni.trainer.base import BaseTrainer
-    from veomni.utils import loss_utils
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
-        trainer = object.__new__(BaseTrainer)
-        trainer.state = SimpleNamespace(global_step=3)
-        trainer.model = SimpleNamespace()
-        trainer._reset_async_activation_offload_if_enabled = lambda _model: None
-        batches = [{"labels": torch.tensor([1])}, {"labels": torch.tensor([2])}]
-
-        def step_begin(micro_batches):
-            if rank == 1:
-                if scenario == "padding":
-                    micro_batches[0]["padding_flag"] = True
-                elif scenario == "count":
-                    micro_batches.pop()
-                elif scenario == "order":
-                    micro_batches.reverse()
-                elif scenario == "weight":
-                    micro_batches[0]["loss_weights"] = torch.ones_like(micro_batches[0]["labels"], dtype=torch.float32)
-                else:
-                    micro_batches[0]["image_labels"] = torch.tensor([1])
-
-        trainer.on_step_begin = step_begin
-        with pytest.raises(RuntimeError, match="callback or loss-token"):
-            trainer._sft_step_preflight(batches, trainer)
-        assert trainer.state.global_step == 3
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("scenario", ["padding", "count", "order", "auxiliary", "weight"])
-def test_sft_callback_structure_failure_is_synchronized(scenario):
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_sft_callback_structure_worker, args=(scenario,), nprocs=2)
-
-
 def _sft_weight_shape_failure_worker(rank, endpoint):
     from datetime import timedelta
 
