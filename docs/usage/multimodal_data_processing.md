@@ -45,6 +45,12 @@ the weighted optimization objective.
 If an entire step has no supervised target mass, it is rejected before
 the optimizer runs; this avoids changing weights through momentum or decay when
 the data requested no update. Weighted DPO is not supported and is rejected.
+In single-process SFT, marked padding is excluded from the loss and metrics,
+and its model forward/backward is skipped. Distributed loaders must not inject
+padded micro-batches. Distributed SFT main-process dynamic batching requires
+`drop_last=True` until tail step counts can be coordinated. Native DPO permits
+`drop_last=False` without padding or implicit replay; DPO, Omni and DiT reject
+marked padding.
 
 ## Image Resolution Control
 
