@@ -101,6 +101,7 @@ logger = logging.get_logger(__name__)
 
 
 def _copy_prefetch_state(state):
+    """Detach a cursor using deepcopy or the checkpoint serialization contract."""
     try:
         return copy.deepcopy(state)
     except Exception:  # noqa: BLE001 - try the actual checkpoint serialization contract
@@ -134,6 +135,7 @@ class BackgroundPrefetcher:
         self.thread.start()
 
     def _worker(self):
+        """Queue each batch with an optional isolated cursor and snapshot error."""
         try:
             while not self.stop_event.is_set():
                 try:
@@ -164,6 +166,7 @@ class BackgroundPrefetcher:
         return self
 
     def __next__(self):
+        """Return a prefetched batch and publish only that batch's cursor."""
         res = self.queue.get()
         if isinstance(res, tuple) and len(res) in (2, 3):
             item, state = res[:2]
@@ -182,6 +185,7 @@ class BackgroundPrefetcher:
             return res
 
     def state_dict(self):
+        """Return the last consumed cursor or reject an unsafe checkpoint."""
         if self._state_error is not None:
             raise RuntimeError("Cannot checkpoint prefetcher without a recoverable data cursor") from self._state_error
         if self.current_state is not None:
