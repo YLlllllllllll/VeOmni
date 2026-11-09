@@ -622,6 +622,7 @@ class BaseTrainer(Stateful, ABC):
             except Exception as exc:
                 error = exc
             raise_if_any_rank_failed(error, "constructing the cyclic packing loader")
+            self.train_dataloader.validate_creation_consensus()
             return
         if cyclic_contract is not None or cyclic_deterministic:
             raise ValueError("cyclic input attestation requires data.dataloader.type='cyclic_packed'")
@@ -635,6 +636,8 @@ class BaseTrainer(Stateful, ABC):
             self.model.optimizer.step()
             self.model.lr_scheduler.step()
             self.model.optimizer.zero_grad()
+            if cyclic:
+                self.train_dataloader.validate_pending_step()
         except Exception as exc:
             if not cyclic:
                 raise
