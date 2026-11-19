@@ -178,7 +178,7 @@ Training from an upstream root:
   [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L372);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L255) resolves through `HFSource.weights_path`.
 - For a fresh load, non-meta modules load weights during `_build_model`; meta-initialized modules load during the FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L267)):
-  - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L414) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1212) skip keys the converter declares, without reading them;
+  - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L574) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1385) skip keys the converter declares, without reading them;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L515) renames the module's own keys and hands them to the module's converter.
 
   For a full non-LoRA DCP resume, meta-initialized trainable modules skip the HF weight load and are restored from DCP. Non-meta initialization, LoRA modules and frozen modules with persistent state still load their HF weights as needed.

@@ -25,6 +25,20 @@
     ]
   },
   {
+    "name": "qwen4-hybrid-native-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_hybrid_u2cp2_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_gated_deltanet_hybrid_u2cp2_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_hybrid",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_hybrid"
+    ]
+  },
+  {
     "name": "npu-unit-02",
     "suite": "unit",
     "args": [
@@ -41,6 +55,15 @@
       "-s",
       "-x",
       "tests/trainer/test_channel_loss_callback.py"
+    ]
+  },
+  {
+    "name": "dpo-pair-normalization-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_dpo_pair_mean.py"
     ]
   },
   {
@@ -172,7 +195,8 @@
       "-s",
       "-x",
       "tests/trainer/test_aux_metrics.py",
-      "tests/trainer/test_padding_loss.py"
+      "tests/trainer/test_padding_loss.py",
+      "tests/trainer/test_weighted_cross_safety.py"
     ]
   },
   {

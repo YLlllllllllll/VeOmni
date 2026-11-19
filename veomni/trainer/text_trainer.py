@@ -52,7 +52,7 @@ class TextTrainer:
             self._build_data_transform()
             self.base._build_dataset()
             self.base._build_collate_fn()
-            self.base._build_dataloader()
+            self.base._build_sft_dataloader()
         self.base._build_lr_scheduler()
         self.base._build_training_context(self.base.model)
         self.base._sft_dynamic_exact_resume = args.data.data_type in ("plaintext", "conversation")
@@ -114,7 +114,9 @@ class TextTrainer:
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            self.base.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self.base._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -127,9 +129,7 @@ class TextTrainer:
         grad_norm = self.base.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.base.model.optimizer.step()
-        self.base.model.lr_scheduler.step()
-        self.base.model.optimizer.zero_grad()
+        self.base._complete_optimizer_step()
 
         self.on_step_end(
             loss=total_loss,

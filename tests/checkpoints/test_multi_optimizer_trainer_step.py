@@ -92,13 +92,13 @@ def test_trainer_state_cannot_silently_diverge_from_restored_optimizer(tmp_path,
     ):
         if mode in (
             "missing",
+            "legacy_missing",
             "wrong_step",
             "invalid_step",
             "optimizer_step_missing",
             "generation_missing",
             "cursor_generation_missing",
             "cursor_generation_wrong",
-            "legacy_missing",
         ):
             expected = {
                 "missing": (RuntimeError, "Trainer state is missing"),
@@ -375,9 +375,12 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
                 callback.load_global_state()
                 assert trainer.state.global_step == 3
             elif mode == "asymmetric_loader_error":
-                with pytest.raises(
-                    (ValueError, RuntimeError), match="iterator failure|initializing the custom data iterator"
-                ):
+                expected = (
+                    (ValueError, "injected iterator failure")
+                    if rank == 0
+                    else (RuntimeError, "initializing the custom data iterator failed on another rank")
+                )
+                with pytest.raises(expected[0], match=expected[1]):
                     callback.load_global_state()
             else:
                 expected = {

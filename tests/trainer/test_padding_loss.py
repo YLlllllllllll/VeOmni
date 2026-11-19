@@ -168,6 +168,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         get_torch_device().set_device(rank)
     backend = get_dist_comm_backend() if accelerator else "gloo"
     dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
     callback_module.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
     original_reduce = dist.all_reduce
     reduce_sizes = []
@@ -207,9 +208,9 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         results = [None, None]
         dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
         assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
-        assert all(sizes == [7, 2] for _, _, sizes, *_ in results)
+        assert all(sizes == [7, 13] for _, _, sizes, *_ in results)
         assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
-        assert results[1][3] and results[1][4] is None
+        assert results[1][3] and results[1][4] is None, results
 
         error = ValueError("strict source missing") if rank == 0 else None
         with pytest.raises(RuntimeError, match="DPO step-begin callback failed"):
@@ -369,26 +370,78 @@ def test_distributed_dynamic_tail_is_explicitly_rejected(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("trainer_name", ["dpo", "omni"])
-def test_composed_trainers_reject_padding_before_updating(trainer_name):
-    from veomni.trainer.omni.omni_trainer import OmniTrainer
-    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+def _dpo_dynamic_tail_builder_worker(rank, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
 
-    trainer_type = TextDPOTrainer if trainer_name == "dpo" else OmniTrainer
-    trainer = object.__new__(trainer_type)
+    import torch.distributed as dist
+
+    from veomni.data import data_loader as loaders
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        state = SimpleNamespace(dp_size=2, dp_rank=rank, sp_size=1, sp_enabled=False)
+        kwargs = dict(
+            dataset=[{"labels": torch.tensor([1])}, {"labels": torch.tensor([2])}],
+            micro_batch_size=1,
+            global_batch_size=2,
+            dataloader_batch_size=1,
+            max_seq_len=8,
+            train_steps=1,
+            dyn_bsz=True,
+            dyn_bsz_runtime="main",
+            drop_last=False,
+            num_workers=0,
+            prefetch_factor=None,
+            pin_memory=False,
+            collate_fn=lambda batch: batch,
+        )
+        with patch.object(loaders, "get_parallel_state", return_value=state):
+            with pytest.raises(ValueError, match="requires drop_last=True"):
+                loaders.build_native_dataloader(**kwargs)
+            loader = loaders.build_native_dataloader(**kwargs, _dpo_no_synthetic_padding=True)
+        assert loader._dpo_disallow_implicit_restart is True
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_dpo_dynamic_tail_builder_retains_no_synthetic_padding_policy():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_dpo_dynamic_tail_builder_worker, nprocs=2)
+
+
+@pytest.mark.parametrize("trainer_name", ["dpo", "omni"])
+def test_composed_trainers_reject_padding_before_updating(trainer_name, monkeypatch):
+    from veomni.trainer.omni.omni_trainer import OmniTrainer
+
     if trainer_name == "dpo":
-        trainer.base = SimpleNamespace()
-    trainer.state = SimpleNamespace(global_step=3)
-    with pytest.raises(ValueError, match="does not support padded micro-batches"):
-        trainer.train_step(iter([[{"padding_flag": True}]]))
-    assert trainer.state.global_step == 3
-    with pytest.raises(ValueError, match="does not support padded micro-batches"):
-        trainer.forward_backward_step({"padding_flag": True})
-    if trainer_name == "omni":
+        from tests.trainer.test_dpo_pair_mean import _build_trainer, _microbatch
+
+        state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0)
+        trainer, _ = _build_trainer(state, distributed=False, monkeypatch=monkeypatch)
+        batch = _microbatch([1])
+        batch["padding_flag"] = True
+        with pytest.raises(RuntimeError, match="padding"):
+            trainer.train_step(iter([[batch]]))
+        assert trainer.state.global_step == 0
+        assert trainer.policy_model.optimizer.steps == 0
+    else:
+        trainer = object.__new__(OmniTrainer)
+        trainer.state = SimpleNamespace(global_step=3)
+        with pytest.raises(ValueError, match="does not support padded micro-batches"):
+            trainer.train_step(iter([[{"padding_flag": True}]]))
+        assert trainer.state.global_step == 3
         trainer.offline_cache_writer = object()
         with pytest.raises(ValueError, match="does not support padded micro-batches"):
             trainer.offline_cache_step(iter([[{"padding_flag": True}]]))
         assert trainer.state.global_step == 3
+    with pytest.raises(ValueError, match="does not support padded micro-batches"):
+        trainer.forward_backward_step({"padding_flag": True})
 
 
 @pytest.mark.parametrize("trainer_name", ["base", "text", "vlm"])
@@ -402,11 +455,6 @@ def test_all_padding_step_does_not_advance_training_state(monkeypatch, trainer_n
         "text": (text_module, text_module.TextTrainer),
         "vlm": (vlm_module, vlm_module.VLMTrainer),
     }[trainer_name]
-    monkeypatch.setattr(
-        base_module,
-        "reduce_global_loss_token",
-        lambda counts, **kwargs: {key: value.item() for key, value in counts.items()},
-    )
     trainer = object.__new__(cls)
     state = SimpleNamespace(global_step=3)
     updates = []
@@ -652,7 +700,29 @@ def test_dpo_wrapper_reads_and_clears_base_preflight_clock_across_steps(monkeypa
         assert "_step_preflight_start_time" not in trainer.__dict__
 
 
-def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
+@pytest.mark.parametrize("preflight", [False, True])
+def test_reordered_channel_capture_counts_elapsed_once(monkeypatch, preflight):
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.callbacks import trace_callback
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = SimpleNamespace()
+    trainer.environ_meter = SimpleNamespace(add=lambda _batch: None)
+    trainer._step_preflight_start_time = 100.0 if preflight else None
+    meter = object.__new__(trace_callback.EnvironMeterCallback)
+    meter.trainer = trainer
+    channel = SimpleNamespace(on_step_begin=lambda *_args, **_kwargs: None)
+    trainer.channel_loss_callback, trainer.environ_meter_callback = channel, meter
+    trainer._callbacks = [meter, channel]
+    clock = iter((10.0, 13.0))
+    monkeypatch.setattr(trace_callback.time, "time", lambda: 130.0)
+    monkeypatch.setattr(trace_callback.time, "perf_counter", lambda: next(clock))
+    trainer.on_step_begin(micro_batches=[{"labels": torch.tensor([1])}])
+    assert meter.start_time == (100.0 if preflight else 127.0)
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch, weighted):
     import copy
 
     import veomni.data.data_collator as collator_module
@@ -672,11 +742,19 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(0.25))
             self.parallel_state = parallel_state
+            self.model_config = SimpleNamespace(model_type="qwen4_exp")
+            self.unwrapped_module = SimpleNamespace(veomni_ce=SimpleNamespace(impl="chunk_loss"))
 
-        def forward(self, input_ids, labels, use_cache=False, **_kwargs):
+        def forward(self, input_ids, labels, use_cache=False, loss_weights=None, **_kwargs):
             targets = labels[..., 1:]
             logits = self.weight * input_ids[..., :-1].float().unsqueeze(-1) * torch.arange(8, dtype=torch.float32)
-            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 8), targets.reshape(-1), ignore_index=-100)
+            per_token = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, 8), targets.reshape(-1), ignore_index=-100, reduction="none"
+            ).reshape_as(targets)
+            mass = (targets != -100).float()
+            if loss_weights is not None:
+                mass = mass * loss_weights[..., 1:]
+            loss = (per_token * mass).sum() / mass.sum()
             return SimpleNamespace(loss=loss)
 
     collator = collator_module.PackingCollator()
@@ -699,6 +777,10 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
         [{"input_ids": torch.tensor([6, 7]), "labels": torch.tensor([-100, 7]), "position_ids": torch.tensor([0, 1])}]
     )
 
+    if weighted:
+        packed["loss_weights"] = torch.tensor([[0.0, 0.25, 1.0, 0.5, 0.75]])
+        packed_other["loss_weights"] = torch.tensor([[0.0, 0.4]])
+
     def run(pad, mask_mode=None):
         model = TinyModel()
         model.optimizer = torch.optim.AdamW(model.parameters(), lr=0.02, weight_decay=0.1)
@@ -719,6 +801,9 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
         trainer.sync_before_train_step = lambda: None
 
         def step_begin(micro_batches):
+            recorded["callback_real_batches"] = sum(
+                not loss_utils.is_padding_microbatch(batch) for batch in micro_batches
+            )
             if mask_mode == "callback":
                 micro_batches[0]["labels"][0, 1] = -100
 
@@ -735,6 +820,7 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
     assert torch.equal(actual["gradient"], reference["gradient"])
     assert torch.equal(actual_weight, reference_weight)
     assert actual["loss"] == reference["loss"]
+    assert actual["callback_real_batches"] == reference["callback_real_batches"] == 2
 
     masked_reference, masked_reference_weight = run(False, "before")
     masked_callback, masked_callback_weight = run(False, "callback")
@@ -748,24 +834,25 @@ def _dpo_weight_guard_worker(rank, endpoint):
 
     import torch.distributed as dist
 
-    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+    from tests.trainer.test_dpo_pair_mean import _build_trainer, _microbatch
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
-        trainer = object.__new__(TextDPOTrainer)
-        trainer.base = SimpleNamespace(
-            state=SimpleNamespace(global_step=3),
-            _reset_async_activation_offload_if_enabled=lambda _model: None,
-            on_step_begin=lambda micro_batches, **_kwargs: micro_batches[0].pop("loss_weights", None),
-        )
-        trainer.policy_model = SimpleNamespace()
+        state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD)
+        trainer, _ = _build_trainer(state, distributed=True)
+        callback_calls = []
+        trainer.base.on_step_begin = lambda **_kwargs: callback_calls.append(True)
         for key in ("loss_weight", "loss_weights"):
-            batch = {"labels": torch.tensor([1, 2])}
+            batch = _microbatch([1])
             if rank == 1:
                 batch[key] = torch.tensor([0.5, 0.5])
-            with pytest.raises(RuntimeError, match="DPO preforward validation failed"):
+            with pytest.raises(
+                RuntimeError, match="DPO pair-count preflight failed.*does not support token loss_weights"
+            ):
                 trainer.train_step(iter([[batch]]))
-            assert trainer.state.global_step == 3
+            assert trainer.state.global_step == 0
+            assert trainer.policy_model.optimizer.steps == 0
+            assert not callback_calls
         with pytest.raises(RuntimeError, match="end of data at different times"):
             loss_utils.fetch_training_micro_batches(iter([] if rank == 0 else [[{"labels": torch.tensor([1])}]]))
         with pytest.raises(StopIteration):
@@ -787,36 +874,39 @@ def test_dpo_asymmetric_weights_fail_before_forward_on_all_ranks():
     spawn_with_rendezvous(_dpo_weight_guard_worker, args=(), nprocs=2)
 
 
-def test_dpo_step_begin_stop_iteration_is_not_loader_eof():
-    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+def test_dpo_step_begin_stop_iteration_is_not_loader_eof(monkeypatch):
+    from tests.trainer.test_dpo_pair_mean import _build_trainer, _microbatch
 
     def stop(**_kwargs):
         raise StopIteration("callback")
 
-    trainer = object.__new__(TextDPOTrainer)
-    trainer.base = SimpleNamespace(
-        state=SimpleNamespace(global_step=3),
-        _reset_async_activation_offload_if_enabled=lambda _model: None,
-        on_step_begin=stop,
-    )
-    trainer.policy_model = SimpleNamespace()
+    state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0)
+    trainer, _ = _build_trainer(state, distributed=False, monkeypatch=monkeypatch)
+    trainer.base.on_step_begin = stop
     with pytest.raises(RuntimeError, match="step-begin callback raised StopIteration"):
-        trainer.train_step(iter([[{"labels": torch.tensor([1, 2])}]]))
-    assert trainer.state.global_step == 3
+        trainer.train_step(iter([[_microbatch([1])]]))
+    assert trainer.state.global_step == 0
+    assert trainer.policy_model.optimizer.steps == 0
 
 
 def test_dpo_preflight_timer_includes_padding_validation(monkeypatch):
     import veomni.trainer.text_dpo_trainer as dpo_module
+    from tests.trainer.test_dpo_pair_mean import _build_trainer, _microbatch
 
     events = []
     monkeypatch.setattr(dpo_module, "time", SimpleNamespace(time=lambda: events.append("timer") or 123))
-    monkeypatch.setattr(loss_utils, "contains_padding", lambda _batch: events.append("padding") or True)
-    trainer = object.__new__(dpo_module.TextDPOTrainer)
-    trainer.base = SimpleNamespace()
-    with pytest.raises(ValueError, match="does not support padded micro-batches"):
-        trainer.train_step(iter([[{"padding_flag": True}]]))
+
+    def reject(*_args, **_kwargs):
+        events.append("validation")
+        raise ValueError("rejected batch")
+
+    monkeypatch.setattr(dpo_module, "_dpo_pair_weighting", reject)
+    state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0)
+    trainer, _ = _build_trainer(state, distributed=False, monkeypatch=monkeypatch)
+    with pytest.raises(ValueError, match="rejected batch"):
+        trainer.train_step(iter([[_microbatch([1])]]))
     assert trainer.base._step_preflight_start_time == 123
-    assert events == ["timer", "padding"]
+    assert events == ["timer", "validation"]
 
 
 def _sft_fetch_guard_worker(rank, endpoint):

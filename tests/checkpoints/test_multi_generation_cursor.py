@@ -689,6 +689,17 @@ def test_optimizer_resume_without_trainer_state_is_rejected(tmp_path, monkeypatc
     assert trainer.state.global_step == 0
 
 
+def test_missing_trainer_state_accepts_weights_only_without_an_optimizer(tmp_path, monkeypatch):
+    trainer = _make_mock_trainer(save_path=str(tmp_path / "new"))
+    trainer.args.train.checkpoint.load_path = str(tmp_path / "old" / "global_step_0")
+    trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+    trainer.optimizer = None
+    trainer.lr_scheduler = None
+    callback = GlobalStateCallback(trainer)
+    monkeypatch.setattr(callback, "_read_current", lambda _: None)
+    assert callback.load_global_state() is None
+
+
 def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
     from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -799,6 +810,34 @@ def test_legacy_omni_missing_trainable_provider_is_not_certified(tmp_path, monke
     with pytest.raises(RuntimeError, match="cannot confirm optimizer identity"):
         callback._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
     assert manager._last_saved_step == -1
+
+
+def test_legacy_omni_aggregate_optimizer_uses_child_checkpoint_managers(tmp_path, monkeypatch):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+    from veomni.trainer.callbacks.global_state_callback import _legacy_optimizer_checkpoints
+
+    child = _make_mock_runtime(save_path=str(tmp_path))
+    child.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
+        child.checkpoint = ModelCheckpointManager(child)
+    root = OmniModelRuntime(model=None, module_runtimes={"child": child})
+    root._build_optimizer()
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.model = root
+
+    known, unknown = _legacy_optimizer_checkpoints(trainer)
+    assert known == [("module:child", child.checkpoint)]
+    assert unknown == []
+    load_path = layout.step_dir(str(tmp_path), 2)
+    child.checkpoint._loaded_checkpoint_path = load_path
+    trainer.checkpoint_callback = CheckpointCallback(trainer)
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(layout, "read_manifest", lambda _: {"model_state": True, "global_step": 2, "world_size": 1})
+    GlobalStateCallback(trainer)._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
+    assert child.checkpoint._last_saved_step == 2
 
 
 def test_mixed_omni_receipt_confirms_every_optimizer(tmp_path, monkeypatch):

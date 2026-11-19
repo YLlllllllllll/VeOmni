@@ -699,6 +699,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
+| allow_hybrid_cp | `bool` | `False` | Explicit Qwen4-Exp opt-in for simultaneous Ulysses and context parallelism on compatible GPU/NPU backends. The combined degree must divide both GDN key and value head counts; other model families retain their capability guards. GDN uses sequence-to-head exchange, not recurrent-state context sharding. Hardware numerical and checkpoint-resume qualification remain profile-specific. |
 | skip_sp_gather_between_modules | `bool` | `False` | Run-wide SeedOmni switch: every module's `post_forward` hands its sequence-parallel shard directly to the next module instead of all-gathering full-sequence tensors onto `conversation_list` (`encode`/`vision` -> `llm` and `llm` -> `decode`). Global to the run — per-module YAML overrides are ignored, since one side of a handoff gathering while the other does not would leave the backbone with a shard-sized input and full-length positions. |
 | init_device | `Literal["cuda", "meta", "npu", "mlu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
@@ -1020,6 +1021,11 @@ derived argument groups below.
 
 `dpo_config.*` — Direct Preference Optimization hyperparameters.
 
+`dpo_config.explicit_segment_provenance` (default `true`) requires built-in DPO
+segment metadata to distinguish one-token segments from padding. See the
+[DPO guide](../examples/qwen3_dpo.md#experimental-explicit-segment-provenance)
+for supported inputs, rank agreement, and checkpoint restrictions.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | beta | `float` | `0.1` | KL penalty coefficient. Controls deviation from the reference model. |
@@ -1028,5 +1034,9 @@ derived argument groups below.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
+| explicit_segment_provenance | `bool` | `True` | Required local packed-segment provenance and error coordination; same inputs across SP ranks are a caller contract. |
+| audited_unpadded_tokenizer_sha256 | `str \| null` | `null` | Fingerprint of an explicitly audited fast tokenizer; see the DPO guide. |
+| allow_legacy_data_resume | `bool` | `False` | Legacy compatibility field; it cannot bypass required provenance. |
+| allow_legacy_objective_resume | `bool` | `False` | Legacy compatibility field; it cannot bypass the producer-contract checkpoint gate. |
 
 The frozen reference always copies `model`. A custom `reference_model` config is not supported.

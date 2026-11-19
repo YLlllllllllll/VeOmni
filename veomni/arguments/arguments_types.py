@@ -1037,7 +1037,15 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    allow_hybrid_cp: bool = field(
+        default=False,
+        metadata={"help": "Opt in to model-qualified combined Ulysses/CP; currently Qwen4-Exp only."},
+    )
+
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
+
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
@@ -1082,7 +1090,7 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -1385,6 +1393,21 @@ class TrainingArguments:
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    cyclic_input_contract: Optional[str] = field(
+        default=None,
+        kw_only=True,
+        metadata={"help": "SHA256 identity of immutable inputs and deterministic preprocessing for cyclic packing."},
+    )
+    cyclic_input_deterministic: bool = field(
+        default=False,
+        kw_only=True,
+        metadata={"help": "Attest that cyclic packing inputs and collation are deterministic and stateless."},
+    )
+    cyclic_max_buffer_bytes: int = field(
+        default=512 * 1024 * 1024,
+        kw_only=True,
+        metadata={"help": "Soft decoded-feature storage budget for cyclic packing, plus one lookahead."},
+    )
 
     def __post_init__(self):
         if self.dyn_bsz_physical_overflow_ratio < 1.0:

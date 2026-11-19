@@ -12,7 +12,7 @@ throughput.
 
 The single-model trainers count tokens from `input_ids` and pick one FLOPs
 formula from the model's `model_type`
-([`EnvironMeter`](../../../veomni/utils/helper.py#L220) +
+([`EnvironMeter`](../../../veomni/utils/helper.py#L202) +
 [`VeomniFlopsCounter`](../../../veomni/utils/count_flops.py#L73)). An
 `OmniModel` is a composition of independent modules (text encoder, vision
 encoder, AR backbone, VQ codec, ...). It has no single config to dispatch a
@@ -144,7 +144,7 @@ same dict and `WandbTraceCallback` logs it.
 | [`trace/<module>/tokens_per_second(M)`](../../../veomni/utils/omni_helper.py#L201) | This module's global tokens this step / `delta_time`. |
 | [`trace/<module>/consume_tokens(M)`, `(B)`](../../../veomni/utils/omni_helper.py#L202) | This module's cumulative global tokens. |
 | [`trace/<module>/avg_seq_len`](../../../veomni/utils/omni_helper.py#L205) | This module's global tokens this step / `global_batch_size`. |
-| `max_memory_allocated(GB)`, `cpu_used_memory(GB)`, ... | Device and host memory, reduced to the worst rank by [`compute_device_memory_metrics`](../../../veomni/utils/helper.py#L178) (shared with `EnvironMeter`). |
+| `max_memory_allocated(GB)`, `cpu_used_memory(GB)`, ... | Device and host memory, reduced to the worst rank by [`compute_device_memory_metrics`](../../../veomni/utils/helper.py#L160) (shared with `EnvironMeter`). |
 | `multi_source/...` | Only with `data.enable_multisource`; see [Multi-source accounting](#multi-source-accounting). |
 
 `<module>` is the module's name in the `OmniModel` (the key of
@@ -162,8 +162,7 @@ reported per module under `trace/<module>/` and there is no top-level
 `consume_tokens` is part of
 [`OmniEnvironMeter.state_dict()`](../../../veomni/utils/omni_helper.py#L111),
 which `GlobalStateCallback`
-[saves](../../../veomni/trainer/callbacks/global_state_callback.py#L332) and
-[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L901), so
+[saves and restores](../../../veomni/trainer/callbacks/global_state_callback.py), so
 the cumulative counters survive a resume.
 
 ## Rules for a correct implementation

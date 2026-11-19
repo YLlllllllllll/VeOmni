@@ -87,7 +87,7 @@ so the cache looks complete and the error only shows in `offline_training`.
 `offline_embedding` freezes every module, so it never writes or restores module
 weights; encoder weights always come from each module's `model_path`. A saved
 step is therefore only the cursor, and its manifest
-[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L428), so
+[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L473), so
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
@@ -141,7 +141,7 @@ full, or it is built on meta.
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L279) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
-  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1201),
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1204),
   because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 

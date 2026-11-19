@@ -833,6 +833,9 @@ while its grouped weight-gradient GEMM and gradient reduction use FP32. This
 avoids rounding each local expert gradient to BF16 before reduction; it does
 not make the rest of the model's BF16 computation equivalent to FP32.
 
+SeedOmni `ModuleRuntime` rejects the opt-in when enabled in its resolved
+per-module accelerator configuration, regardless of `fsdp_scope`.
+
 The current integration requires Qwen4-Exp SiLU `fused_npu`, FSDP2, TP=PP=1,
 FP32 reduction, native communication, and `torch.compile` disabled. Each rank
 validates its local precision settings and constructed expert modules before
@@ -841,7 +844,8 @@ use the same settings. SeedOmni `ModuleRuntime` rejects the opt-in when enabled
 in its resolved per-module accelerator configuration, regardless of `fsdp_scope`.
 Composed Omni wraps and custom model parallelization also reject the opt-in. MoE
 LoRA expert wrappers reject the opt-in because
-their separate kernel is not covered. DPO reference-model isolation and resume
+their separate kernel is not covered. DPO keeps the option on the policy and
+disables this weight-gradient-only option on its frozen reference model. Resume
 configuration checks are not wired by this option yet. Keep the setting fixed
 across checkpoint save and resume when comparing training trajectories.
 

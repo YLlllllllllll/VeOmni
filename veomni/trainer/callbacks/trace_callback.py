@@ -228,6 +228,7 @@ class EnvironMeterCallback(Callback):
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
             parallel_state=self.parallel_state,
+            dpo_provenance_enabled=getattr(getattr(args, "dpo_config", None), "explicit_segment_provenance", False),
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
@@ -236,6 +237,7 @@ class EnvironMeterCallback(Callback):
                 self.trainer.environ_meter.add(micro_batch)
         clock_owner = getattr(self.trainer, "base", self.trainer)
         preflight_start = getattr(clock_owner, "_step_preflight_start_time", None)
+        self._step_timing_used_preflight = preflight_start is not None
         self.start_time = preflight_start if preflight_start is not None else time.time()
         clock_owner._step_preflight_start_time = None
 
@@ -295,7 +297,9 @@ class TqdmCallback(Callback):
         )
 
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
-        self.data_loader_tqdm.close()
+        progress = getattr(self, "data_loader_tqdm", None)
+        if progress is not None:
+            progress.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())

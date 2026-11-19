@@ -361,6 +361,96 @@ def test_uninterrupted_warmup_batch_sequence_is_unchanged():
     assert loader.state_dict()["step"] == 3
 
 
+@pytest.mark.parametrize("dpo_recovery", [False, True])
+def test_restore_copies_tensor_buffer(dpo_recovery):
+    original = _loader()
+    next(iter(original))
+    state = original.state_dict()
+    marker = torch.arange(8)
+    state["item_buffer"].append({"payload": marker})
+    resumed = _loader()
+    resumed._dpo_disallow_implicit_restart = dpo_recovery
+
+    resumed.load_state_dict(state)
+
+    assert torch.equal(resumed.item_buffer[0]["payload"], marker)
+    assert resumed.item_buffer[0]["payload"].data_ptr() != marker.data_ptr()
+    assert state["_veomni_resume_phase"] == "after_yield"
+
+
+def test_regular_restore_does_not_mutate_a_reusable_checkpoint_buffer():
+    def make_loader():
+        return DynamicBatchSizeDataLoader(
+            _StatefulSamples(),
+            TextBatchingStrategy(token_micro_bsz=1, buffer_size=3),
+            num_micro_batch=1,
+            length=10,
+        )
+
+    original = make_loader()
+    next(iter(original))
+    state = original.state_dict()
+    expected = [sample["id"] for sample in next(original)[0]]
+
+    resumed_once = make_loader()
+    resumed_once.load_state_dict(state)
+    assert [sample["id"] for sample in next(iter(resumed_once))[0]] == expected
+
+    resumed_again = make_loader()
+    resumed_again.load_state_dict(state)
+    assert [sample["id"] for sample in next(iter(resumed_again))[0]] == expected
+
+
+class _FiniteSamples(_StatefulSamples):
+    def __init__(self, count):
+        super().__init__()
+        self.count = count
+
+    def __next__(self):
+        if self.cursor >= self.count:
+            raise StopIteration
+        return super().__next__()
+
+
+def _finite_dpo_loader(count, *, buffer_size=1, num_micro_batch=1, drop_last=True):
+    loader = DynamicBatchSizeDataLoader(
+        _FiniteSamples(count),
+        TextBatchingStrategy(token_micro_bsz=1, buffer_size=buffer_size),
+        num_micro_batch=num_micro_batch,
+        length=5,
+        drop_last=drop_last,
+    )
+    loader._dpo_disallow_implicit_restart = True
+    return loader
+
+
+def test_dpo_drains_buffer_before_eof_and_resumes_during_flush():
+    loader = _finite_dpo_loader(4, buffer_size=3)
+    iterator = iter(loader)
+    assert [[sample["id"] for sample in next(iterator)[0]] for _ in range(3)] == [[1], [2], [3]]
+    checkpoint = loader.state_dict()
+    assert checkpoint["_veomni_resume_phase"] == "flushing"
+    assert [sample["id"] for sample in next(iterator)[0]] == [4]
+    with pytest.raises(RuntimeError, match="implicit data replay is disabled"):
+        next(iterator)
+
+    resumed = _finite_dpo_loader(4, buffer_size=3)
+    resumed.load_state_dict(checkpoint)
+    resumed_iterator = iter(resumed)
+    assert [sample["id"] for sample in next(resumed_iterator)[0]] == [4]
+    with pytest.raises(RuntimeError, match="implicit data replay is disabled"):
+        next(resumed_iterator)
+
+
+@pytest.mark.parametrize("drop_last", [False, True])
+def test_dpo_partial_final_step_never_replays_or_pads(drop_last):
+    loader = _finite_dpo_loader(3, num_micro_batch=2, drop_last=drop_last)
+    iterator = iter(loader)
+    assert [[sample["id"] for sample in microbatch] for microbatch in next(iterator)] == [[1], [2]]
+    with pytest.raises(RuntimeError, match="implicit data replay is disabled|neither is supported"):
+        next(iterator)
+
+
 def test_multiple_microbatches_resume_with_the_same_next_group():
     def make_loader():
         return DynamicBatchSizeDataLoader(
@@ -483,6 +573,29 @@ def test_invalid_resume_phase_is_rejected():
     state["_veomni_resume_phase"] = "invalid"
     with pytest.raises(ValueError, match="invalid dynamic loader resume phase"):
         _loader().load_state_dict(state)
+
+
+def test_dpo_dynamic_loader_rejects_implicit_dataset_replay():
+    source = [{"id": 1, "attention_mask": torch.ones(1, dtype=torch.int64)}]
+
+    def make_loader(disallow_restart):
+        loader = DynamicBatchSizeDataLoader(
+            source,
+            TextBatchingStrategy(token_micro_bsz=1, buffer_size=1),
+            collate_fn=lambda samples: {"ids": [sample["id"] for sample in samples]},
+            length=2,
+        )
+        loader._dpo_disallow_implicit_restart = disallow_restart
+        return iter(loader)
+
+    regular = make_loader(False)
+    assert next(regular) == [{"ids": [1]}]
+    assert next(regular) == [{"ids": [1]}]
+
+    dpo_loader = make_loader(True)
+    assert next(dpo_loader) == [{"ids": [1]}]
+    with pytest.raises(RuntimeError, match="implicit data replay is disabled"):
+        next(dpo_loader)
 
 
 def test_real_stateful_loader_resume_at_source_eof_preserves_flush():
