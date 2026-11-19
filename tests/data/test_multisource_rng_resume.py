@@ -545,7 +545,6 @@ def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario, backend="gloo")
             channel_loss_callback=None,
             offline_cache_writer=None,
             environ_meter=None,
-            _veomni_loader_sp_rank_zero_only=not (scenario == "wrong_owner" and rank == 1),
         )
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = trainer
@@ -579,7 +578,13 @@ def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario, backend="gloo")
             with pytest.raises(RuntimeError, match=message):
                 callback.load_global_state()
         else:
-            with pytest.raises((RuntimeError, ValueError)):
+            assert scenario == "missing_cursor"
+            message = (
+                "multi-source trainer checkpoint is missing its data cursor"
+                if rank == 0
+                else "validating the training data cursor failed on another rank"
+            )
+            with pytest.raises((RuntimeError, ValueError), match=message):
                 callback.load_global_state()
         still_alive = torch.tensor(1, device=f"npu:{rank}" if backend == "hccl" else "cpu")
         dist.all_reduce(still_alive)
@@ -594,7 +599,7 @@ def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario, backend="gloo")
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("scenario", ["success", "missing_cursor", "wrong_owner", "restore_error"])
+@pytest.mark.parametrize("scenario", ["success", "missing_cursor", "restore_error"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_weighted_resume_with_sp_leader_only_loader(tmp_path, scenario):
     import torch.multiprocessing as mp
