@@ -1,13 +1,14 @@
 """Regressions for the lifecycle of a multi-source sampling iterator."""
 
 import copy
+import os
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from veomni.data.data_loader import DistributedDataloader
 from veomni.data.dataset import DynamicBatchingSizeDataset, WeightedMultiSourceDataset
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
@@ -491,7 +492,7 @@ def test_multisource_worker_cold_resume_next_optimizer_update(tmp_path):
             source_iterator._shutdown_workers()
 
 
-def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario):
+def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario, backend="gloo"):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -499,16 +500,21 @@ def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario):
     import veomni.data.dataset as dataset_module
     from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
+    if backend == "hccl":
+        torch.npu.set_device(rank)
     dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+        backend, init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=180)
     )
+    device_rng = torch.npu.get_rng_state().clone() if backend == "hccl" else None
     dataset_module.get_parallel_state = lambda: SimpleNamespace(dp_rank=0, dp_size=1)
     original = restored = iterator = None
     try:
         cursor = {}
         expected = None
         if rank == 0:
-            original = DistributedDataloader(make_dataset(seed=5), batch_size=None, num_workers=1)
+            original = DistributedDataloader(
+                make_dataset(seed=5), batch_size=None, num_workers=1, resume_replay_timeout_seconds=60
+            )
             iterator = iter(original)
             next(iterator)
             cursor = copy.deepcopy(original.state_dict())
@@ -516,7 +522,9 @@ def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario):
             expected = next(iterator)
             iterator._shutdown_workers()
             iterator = None
-            restored = DistributedDataloader(make_dataset(seed=5), batch_size=None, num_workers=1)
+            restored = DistributedDataloader(
+                make_dataset(seed=5), batch_size=None, num_workers=1, resume_replay_timeout_seconds=60
+            )
             if scenario == "missing_cursor":
                 cursor = {}
             if scenario == "restore_error":
@@ -542,17 +550,38 @@ def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario):
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = trainer
         callback.parallel_state = SimpleNamespace(sp_enabled=True, sp_rank=rank)
-        callback._read_current = lambda _: {"global_step": 1, "train_dataloader": cursor, "torch_rng_state": saved_rng}
+        callback._read_current = lambda _: {
+            "global_step": 1,
+            "train_dataloader": cursor,
+            "torch_rng_state": saved_rng,
+            "device_rng_state": device_rng,
+        }
+        expected_device_sample = None
+        if backend == "hccl":
+            expected_device_sample = torch.rand(8, device=f"npu:{rank}").cpu()
+            assert not torch.equal(torch.npu.get_rng_state(), device_rng)
         if scenario == "success":
             callback.load_global_state()
             assert torch.equal(torch.get_rng_state(), saved_rng)
+            if backend == "hccl":
+                assert torch.equal(torch.npu.get_rng_state(), device_rng)
+                actual_device_sample = torch.rand(8, device=f"npu:{rank}").cpu()
+                torch.testing.assert_close(actual_device_sample, expected_device_sample, atol=0, rtol=0)
             if rank == 0:
                 iterator = iter(restored)
                 assert next(iterator) == expected
+        elif scenario == "restore_error":
+            message = (
+                "injected worker restore failure"
+                if rank == 0
+                else "restoring the training data cursor failed on another rank"
+            )
+            with pytest.raises(RuntimeError, match=message):
+                callback.load_global_state()
         else:
             with pytest.raises((RuntimeError, ValueError)):
                 callback.load_global_state()
-        still_alive = torch.tensor(1)
+        still_alive = torch.tensor(1, device=f"npu:{rank}" if backend == "hccl" else "cpu")
         dist.all_reduce(still_alive)
         assert still_alive.item() == 2
     finally:
@@ -571,3 +600,31 @@ def test_weighted_resume_with_sp_leader_only_loader(tmp_path, scenario):
     import torch.multiprocessing as mp
 
     mp.spawn(_weighted_sp_owner_resume_worker, args=(str(tmp_path / "rendezvous"), scenario), nprocs=2, join=True)
+
+
+def _native_weighted_replay_plan(context):
+    return LaunchSpec(nproc=2) if context.capabilities.backend == "npu" else LaunchSpec(device="cpu")
+
+
+@pytest.mark.parametrize("scenario", ["success", "restore_error"])
+@pytest.mark.launch_plan(provider=_native_weighted_replay_plan)
+def test_weighted_resume_with_sp_leader_only_loader_native_npu(tmp_path, scenario):
+    import torch.multiprocessing as mp
+
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    ci_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or ci_backend == "npu"
+    available = ci_backend in (None, "npu") and IS_NPU_AVAILABLE and torch.npu.is_available()
+    if not available:
+        if required:
+            pytest.fail("A working NPU is required for HCCL weighted replay")
+        pytest.skip("HCCL weighted replay requires two NPUs")
+    if torch.npu.device_count() < 2:
+        pytest.fail("HCCL weighted replay requires two NPUs")
+    mp.spawn(
+        _weighted_sp_owner_resume_worker,
+        args=(str(tmp_path / "rendezvous"), scenario, "hccl"),
+        nprocs=2,
+        join=True,
+    )
