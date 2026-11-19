@@ -87,11 +87,11 @@ so the cache looks complete and the error only shows in `offline_training`.
 `offline_embedding` freezes every module, so it never writes or restores module
 weights; encoder weights always come from each module's `model_path`. A saved
 step is therefore only the cursor, and its manifest
-[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L348), so
+[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L428), so
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
-[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L398) refuses a
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L405) refuses a
 step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
@@ -139,7 +139,7 @@ full, or it is built on meta.
   [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L175),
   then loaded and wrapped like any other: the run trains nothing, so no module
   gets an optimizer or a checkpoint manager, and
-  [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
+  [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L279) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
   [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1201),
   because DDP rejects a module with no parameter that requires grad.
@@ -278,7 +278,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L572)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L596)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
@@ -363,15 +363,15 @@ A missing module or method still fails before the first request runs.
   [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L168) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L181) cannot be resumed into, and
   [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L324).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
-  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L129),
-  [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L141),
-  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L155),
-  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L178), and
-  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L201).
+  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L161),
+  [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L173),
+  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L187),
+  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L210), and
+  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L233).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
-  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L667).
+  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L684).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2798).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2805).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L89).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):
