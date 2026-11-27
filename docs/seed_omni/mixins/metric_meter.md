@@ -104,7 +104,7 @@ and stored as `trainer.environ_meter`.
   - [`on_step_begin`](../../../veomni/trainer/omni/omni_trainer.py#L551) →
     [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L64)
     - [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) for each micro-batch: sample count, `ds_idx`.
-    - [`start_time = time.time()`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L67)
+    - [`start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L68): use the preflight start time when present, otherwise `time.time()`.
   - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L500) →
     [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L518) →
     [`TrainNodeRunner`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L78) →

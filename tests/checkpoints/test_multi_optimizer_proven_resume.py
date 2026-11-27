@@ -184,6 +184,8 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
 
         leaf = FaultAdamW(model.parameters())
         optimizer = leaf
+        if failure == "previous_async_failure" and rank == 0:
+            DistributedCheckpointer._async_save_failed = True
         state = {
             "model": model,
             "optimizer": optimizer,
@@ -199,18 +201,26 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
             return original(value)
 
         with patch.object(checkpoint_module, "_requires_rank_local_optimizer_checkpoint", inspect_optimizer):
-            with pytest.raises((OSError, RuntimeError), match="injected|failed on another rank|optimizer.*differ"):
+            with pytest.raises(
+                (OSError, RuntimeError),
+                match="injected|failed on another rank|optimizer.*differ|previous asynchronous",
+            ):
                 getattr(DistributedCheckpointer, operation)(
                     checkpoint, state, parallel_state=SimpleNamespace(dp_mode="ddp")
                 )
         if operation == "load":
             assert "_veomni_optimizer_identity_verified" not in state
             assert "_veomni_optimizer_checkpoint_generation" not in state
+        if failure == "previous_async_failure":
+            assert DistributedCheckpointer._async_save_failed is True
+            with pytest.raises(RuntimeError, match="previous asynchronous DCP save failed"):
+                DistributedCheckpointer.wait_for_pending_save()
         assert not Path(checkpoint).exists()
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
     finally:
+        DistributedCheckpointer._async_save_failed = False
         dist.destroy_process_group()
 
 
@@ -223,6 +233,17 @@ def test_asymmetric_optimizer_policy_fails_before_checkpoint_io(tmp_path, operat
     spawn_with_rendezvous(
         _asymmetric_optimizer_policy_worker,
         args=(str(tmp_path / "checkpoint"), operation, failure),
+        nprocs=2,
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_asymmetric_previous_async_failure_stops_save_on_all_ranks(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(
+        _asymmetric_optimizer_policy_worker,
+        args=(str(tmp_path / "checkpoint"), "save", "previous_async_failure"),
         nprocs=2,
     )
 
@@ -645,7 +666,15 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
             return original(path)
 
         DistributedCheckpointer._create_storage_reader = classmethod(reader)
-        with pytest.raises((RuntimeError, OSError), match="inventory reader"):
+        expected = (
+            (OSError, "injected inventory reader failure")
+            if rank == 1
+            else (
+                RuntimeError,
+                "constructing optimizer inventory reader failed on another rank",
+            )
+        )
+        with pytest.raises(expected[0], match=expected[1]):
             DistributedCheckpointer.load(
                 checkpoint,
                 {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
